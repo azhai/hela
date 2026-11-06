@@ -1,0 +1,2579 @@
+// Conversions to and from `string` representations of other data types like integers and booleans.
+package strconv
+
+import "base:runtime"
+import "core:unicode"
+import "core:unicode/utf8"
+import "core:unicode/utf16"
+import "decimal"
+/*
+Parses a boolean value from the input string
+
+**Inputs**
+- s: The input string
+	- true: "1", "t", "T", "true", "TRUE", "True"
+	- false: "0", "f", "F", "false", "FALSE", "False"
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+**Returns**
+- result: The parsed boolean value (default: false)
+- ok: A boolean indicating whether the parsing was successful
+*/
+parse_bool :: proc(s: string, n: ^int = nil) -> (result: bool = false, ok: bool) {
+	switch s {
+	case "1", "t", "T", "true", "TRUE", "True":
+		if n != nil { n^ = len(s) }
+		return true, true
+	case "0", "f", "F", "false", "FALSE", "False":
+		if n != nil { n^ = len(s) }
+		return false, true
+	}
+	return
+}
+/*
+Finds the integer value of the given rune
+
+**Inputs**
+- r: The input rune to find the integer value of
+
+**Returns**   The integer value of the given rune
+*/
+_digit_value :: proc(r: rune) -> int {
+	ri := int(r)
+	v: int = 16
+	switch r {
+	case '0'..='9': v = ri-'0'
+	case 'a'..='z': v = ri-'a'+10
+	case 'A'..='Z': v = ri-'A'+10
+	}
+	return v
+}
+
+@(private)
+overflow_limits :: #force_inline proc "contextless" ($T: typeid, base: int, neg: bool) -> (cut, lim: T) {
+	limits :: #force_inline proc "contextless" ($B: int, neg: bool) -> (cut, lim: T) {
+		when min(T) < 0 {
+			if neg {
+				return min(T)/T(B), -(min(T)%T(B))
+			}
+		}
+		return max(T)/T(B), max(T)%T(B)
+	}
+	switch base {
+	case 2:  return limits(2,  neg)
+	case 8:  return limits(8,  neg)
+	case 10: return limits(10, neg)
+	case 12: return limits(12, neg)
+	case 16: return limits(16, neg)
+	}
+	b := T(base)
+	when min(T) < 0 {
+		if b <= 0 {
+			return // Every digit is `>= b`, so the limits are never used.
+		}
+		if neg {
+			return min(T)/b, -(min(T)%b)
+		}
+	} else {
+		if b == 0 {
+			return // Every digit is `>= b`, so the limits are never used.
+		}
+	}
+	return max(T)/b, max(T)%b
+}
+
+/*
+Parses an integer value from the input string in the given base, without a prefix
+
+**Inputs**
+- str: The input string to parse the integer value from
+- base: The base of the integer value to be parsed (must be between 1 and 16)
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_i64_of_base_example :: proc() {
+		n, ok := strconv.parse_i64_of_base("-1234e3", 10)
+		fmt.println(n, ok)
+	}
+
+Output:
+
+	-1234 false
+
+**Returns**
+- value: Parses an integer value from a string, in the given base, without a prefix.
+- ok: ok=false if no numeric value of the appropriate base could be found, or if the input string contained more than just the number.
+*/
+parse_i64_of_base :: proc(str: string, base: int, n: ^int = nil) -> (value: i64, ok: bool) {
+	assert(base <= 16, "base must be 1-16")
+
+	s := str
+
+	defer if n != nil { n^ = len(str)-len(s) }
+
+	if s == "" {
+		return
+	}
+
+	neg := false
+	if len(s) > 1 {
+		switch s[0] {
+		case '-':
+			neg = true
+			s = s[1:]
+		case '+':
+			s = s[1:]
+		}
+	}
+
+
+	cut, lim := overflow_limits(i64, base, neg)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := i64(_digit_value(r))
+		if v >= i64(base) {
+			break
+		}
+		if neg {
+			// Accumulate negatively so that min(i64) is accepted.
+			if value < cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*i64(base) - v
+		} else {
+			if value > cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*i64(base) + v
+		}
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+/*
+Parses an integer value from the input string in base 10, unless there's a prefix
+
+**Inputs**
+- str: The input string to parse the integer value from
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_i64_maybe_prefixed_example :: proc() {
+		n, ok := strconv.parse_i64_maybe_prefixed("1234")
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_i64_maybe_prefixed("0xeeee")
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	1234 true
+	61166 true
+
+**Returns**
+- value: The parsed integer value
+- ok: ok=false if a valid integer could not be found, or if the input string contained more than just the number.
+*/
+parse_i64_maybe_prefixed :: proc(str: string, n: ^int = nil) -> (value: i64, ok: bool) {
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	neg := false
+	if len(s) > 1 {
+		switch s[0] {
+		case '-':
+			neg = true
+			s = s[1:]
+		case '+':
+			s = s[1:]
+		}
+	}
+
+
+	base: i64 = 10
+	if len(s) > 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b': base =  2;  s = s[2:]
+		case 'o': base =  8;  s = s[2:]
+		case 'd': base = 10;  s = s[2:]
+		case 'z': base = 12;  s = s[2:]
+		case 'x': base = 16;  s = s[2:]
+		}
+	}
+
+
+	cut, lim := overflow_limits(i64, int(base), neg)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := i64(_digit_value(r))
+		if v >= base {
+			break
+		}
+		if neg {
+			// Accumulate negatively so that min(i64) is accepted.
+			if value < cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*base - v
+		} else {
+			if value > cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*base + v
+		}
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+//
+parse_i64 :: proc{parse_i64_maybe_prefixed, parse_i64_of_base}
+/*
+Parses an unsigned 64-bit integer value from the input string without a prefix, using the specified base
+
+**Inputs**
+- str: The input string to parse
+- base: The base of the number system to use for parsing
+	- Must be between 1 and 16 (inclusive)
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_u64_of_base_example :: proc() {
+		n, ok := strconv.parse_u64_of_base("1234e3", 10)
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_u64_of_base("5678eee",16)
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	1234 false
+	90672878 true
+
+**Returns**
+- value: The parsed uint64 value
+- ok: A boolean indicating whether the parsing was successful
+*/
+parse_u64_of_base :: proc(str: string, base: int, n: ^int = nil) -> (value: u64, ok: bool) {
+	assert(base <= 16, "base must be 1-16")
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	if len(s) > 1 && s[0] == '+' {
+		s = s[1:]
+	}
+
+	cut, lim := overflow_limits(u64, base, false)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := u64(_digit_value(r))
+		if v >= u64(base) {
+			break
+		}
+		if value > cut || (value == cut && v > lim) {
+			break
+		}
+		value = value*u64(base) + v
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+/*
+Parses an unsigned 64-bit integer value from the input string, using the specified base or inferring the base from a prefix
+
+**Inputs**
+- str: The input string to parse
+- base: The base of the number system to use for parsing (default: 0)
+	- If base is 0, it will be inferred based on the prefix in the input string (e.g. '0x' for hexadecimal)
+	- If base is not 0, it will be used for parsing regardless of any prefix in the input string
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_u64_maybe_prefixed_example :: proc() {
+		n, ok := strconv.parse_u64_maybe_prefixed("1234")
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_u64_maybe_prefixed("0xee")
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	1234 true
+	238 true
+
+**Returns**
+- value: The parsed uint64 value
+- ok: ok=false if a valid integer could not be found, if the value was negative, or if the input string contained more than just the number.
+*/
+parse_u64_maybe_prefixed :: proc(str: string, n: ^int = nil) -> (value: u64, ok: bool) {
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	if len(s) > 1 && s[0] == '+' {
+		s = s[1:]
+	}
+
+
+	base := u64(10)
+	if len(s) > 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b': base =  2;  s = s[2:]
+		case 'o': base =  8;  s = s[2:]
+		case 'd': base = 10;  s = s[2:]
+		case 'z': base = 12;  s = s[2:]
+		case 'x': base = 16;  s = s[2:]
+		}
+	}
+
+	cut, lim := overflow_limits(u64, int(base), false)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := u64(_digit_value(r))
+		if v >= base {
+			break
+		}
+		if value > cut || (value == cut && v > lim) {
+			break
+		}
+		value = value*base + v
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+//
+parse_u64 :: proc{parse_u64_maybe_prefixed, parse_u64_of_base}
+/*
+Parses a signed integer value from the input string, using the specified base or inferring the base from a prefix
+
+**Inputs**
+- s: The input string to parse
+- base: The base of the number system to use for parsing (default: 0)
+	- If base is 0, it will be inferred based on the prefix in the input string (e.g. '0x' for hexadecimal)
+	- If base is not 0, it will be used for parsing regardless of any prefix in the input string
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_int_example :: proc() {
+		n, ok := strconv.parse_int("1234") // without prefix, inferred base 10
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_int("ffff", 16) // without prefix, explicit base
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_int("0xffff") // with prefix and inferred base
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	1234 true
+	65535 true
+	65535 true
+
+**Returns**
+- value: The parsed int value
+- ok: `false` if no appropriate value could be found, or if the input string contained more than just the number.
+*/
+parse_int :: proc(s: string, base := 0, n: ^int = nil) -> (value: int, ok: bool) {
+	v: i64 = ---
+	switch base {
+	case 0:  v, ok = parse_i64_maybe_prefixed(s, n)
+	case:    v, ok = parse_i64_of_base(s, base, n)
+	}
+	value = int(v)
+	ok = ok && i64(value) == v
+	return
+}
+/*
+Parses an unsigned integer value from the input string, using the specified base or inferring the base from a prefix
+
+**Inputs**
+- s: The input string to parse
+- base: The base of the number system to use for parsing (default: 0, inferred)
+	- If base is 0, it will be inferred based on the prefix in the input string (e.g. '0x' for hexadecimal)
+	- If base is not 0, it will be used for parsing regardless of any prefix in the input string
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_uint_example :: proc() {
+		n, ok := strconv.parse_uint("1234") // without prefix, inferred base 10
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_uint("ffff", 16) // without prefix, explicit base
+		fmt.println(n,ok)
+
+		n, ok = strconv.parse_uint("0xffff") // with prefix and inferred base
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	1234 true
+	65535 true
+	65535 true
+
+**Returns**
+
+value: The parsed uint value
+ok: `false` if no appropriate value could be found; the value was negative; he input string contained more than just the number
+*/
+parse_uint :: proc(s: string, base := 0, n: ^int = nil) -> (value: uint, ok: bool) {
+	v: u64 = ---
+	switch base {
+	case 0:  v, ok = parse_u64_maybe_prefixed(s, n)
+	case:    v, ok = parse_u64_of_base(s, base, n)
+	}
+	value = uint(v)
+	ok = ok && u64(value) == v
+	return
+}
+/*
+Parses an integer value from a string in the given base, without any prefix
+
+**Inputs**
+- str: The input string containing the integer value
+- base: The base (radix) to use for parsing the integer (1-16)
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_i128_of_base_example :: proc() {
+		n, ok := strconv.parse_i128_of_base("-1234eeee", 10)
+		fmt.println(n,ok)
+	}
+
+Output:
+
+	-1234 false
+
+**Returns**
+- value: The parsed i128 value
+- ok: false if no numeric value of the appropriate base could be found, or if the input string contained more than just the number.
+*/
+parse_i128_of_base :: proc(str: string, base: int, n: ^int = nil) -> (value: i128, ok: bool) {
+	assert(base <= 16, "base must be 1-16")
+
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	neg := false
+	if len(s) > 1 {
+		switch s[0] {
+		case '-':
+			neg = true
+			s = s[1:]
+		case '+':
+			s = s[1:]
+		}
+	}
+
+
+	cut, lim := overflow_limits(i128, base, neg)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := i128(_digit_value(r))
+		if v >= i128(base) {
+			break
+		}
+		if neg {
+			// Accumulate negatively so that min(i128) is accepted.
+			if value < cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*i128(base) - v
+		} else {
+			if value > cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*i128(base) + v
+		}
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+/*
+Parses an integer value from a string in base 10, unless there's a prefix
+
+**Inputs**
+- str: The input string containing the integer value
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_i128_maybe_prefixed_example :: proc() {
+		n, ok := strconv.parse_i128_maybe_prefixed("1234")
+		fmt.println(n, ok)
+
+		n, ok = strconv.parse_i128_maybe_prefixed("0xeeee")
+		fmt.println(n, ok)
+	}
+
+Output:
+
+	1234 true
+	61166 true
+
+**Returns**
+- value: The parsed i128 value
+- ok: `false` if a valid integer could not be found, or if the input string contained more than just the number.
+*/
+parse_i128_maybe_prefixed :: proc(str: string, n: ^int = nil) -> (value: i128, ok: bool) {
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	neg := false
+	if len(s) > 1 {
+		switch s[0] {
+		case '-':
+			neg = true
+			s = s[1:]
+		case '+':
+			s = s[1:]
+		}
+	}
+
+
+	base: i128 = 10
+	if len(s) > 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b': base =  2;  s = s[2:]
+		case 'o': base =  8;  s = s[2:]
+		case 'd': base = 10;  s = s[2:]
+		case 'z': base = 12;  s = s[2:]
+		case 'x': base = 16;  s = s[2:]
+		}
+	}
+
+
+	cut, lim := overflow_limits(i128, int(base), neg)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := i128(_digit_value(r))
+		if v >= base {
+			break
+		}
+		if neg {
+			// Accumulate negatively so that min(i128) is accepted.
+			if value < cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*base - v
+		} else {
+			if value > cut || (value == cut && v > lim) {
+				break
+			}
+			value = value*base + v
+		}
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+//
+parse_i128 :: proc{parse_i128_maybe_prefixed, parse_i128_of_base}
+/*
+Parses an unsigned integer value from a string in the given base, without any prefix
+
+**Inputs**
+- str: The input string containing the integer value
+- base: The base (radix) to use for parsing the integer (1-16)
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_u128_of_base_example :: proc() {
+		n, ok := strconv.parse_u128_of_base("1234eeee", 10)
+		fmt.println(n, ok)
+
+		n, ok = strconv.parse_u128_of_base("5678eeee", 16)
+		fmt.println(n, ok)
+	}
+
+Output:
+
+	1234 false
+	1450766062 true
+
+**Returns**
+- value: The parsed u128 value
+- ok: `false` if no numeric value of the appropriate base could be found, or if the input string contained more than just the number.
+*/
+parse_u128_of_base :: proc(str: string, base: int, n: ^int = nil) -> (value: u128, ok: bool) {
+	assert(base <= 16, "base must be 1-16")
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	if len(s) > 1 && s[0] == '+' {
+		s = s[1:]
+	}
+
+	cut, lim := overflow_limits(u128, base, false)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := u128(_digit_value(r))
+		if v >= u128(base) {
+			break
+		}
+		if value > cut || (value == cut && v > lim) {
+			break
+		}
+		value = value*u128(base) + v
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+/*
+Parses an unsigned integer value from a string in base 10, unless there's a prefix
+
+**Inputs**
+- str: The input string containing the integer value
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil)
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_u128_maybe_prefixed_example :: proc() {
+		n, ok := strconv.parse_u128_maybe_prefixed("1234")
+		fmt.println(n, ok)
+
+		n, ok = strconv.parse_u128_maybe_prefixed("5678eeee")
+		fmt.println(n, ok)
+	}
+
+Output:
+
+	1234 true
+	5678 false
+
+**Returns**
+- value: The parsed u128 value
+- ok: false if a valid integer could not be found, if the value was negative, or if the input string contained more than just the number.
+*/
+parse_u128_maybe_prefixed :: proc(str: string, n: ^int = nil) -> (value: u128, ok: bool) {
+	s := str
+	defer if n != nil { n^ = len(str)-len(s) }
+	if s == "" {
+		return
+	}
+
+	if len(s) > 1 && s[0] == '+' {
+		s = s[1:]
+	}
+
+
+	base := u128(10)
+	if len(s) > 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b': base =  2;  s = s[2:]
+		case 'o': base =  8;  s = s[2:]
+		case 'd': base = 10;  s = s[2:]
+		case 'z': base = 12;  s = s[2:]
+		case 'x': base = 16;  s = s[2:]
+		}
+	}
+
+	cut, lim := overflow_limits(u128, int(base), false)
+
+	i, digits := 0, 0
+	for r in s {
+		if r == '_' {
+			i += 1
+			continue
+		}
+		v := u128(_digit_value(r))
+		if v >= base {
+			break
+		}
+		if value > cut || (value == cut && v > lim) {
+			break
+		}
+		value = value*base + v
+		i += 1
+		digits += 1
+	}
+	s = s[i:]
+
+	// Underscores are only separators; at least one digit is required.
+	ok = len(s) == 0 && digits > 0
+	return
+}
+//
+parse_u128 :: proc{parse_u128_maybe_prefixed, parse_u128_of_base}
+/*
+Converts a byte to lowercase
+
+**Inputs**
+- ch: A byte character to be converted to lowercase.
+
+**Returns**
+- A lowercase byte character.
+*/
+@(private)
+lower :: #force_inline proc "contextless" (ch: byte) -> byte { return ('a' - 'A') | ch }
+/*
+Parses a 32-bit floating point number from a string
+
+**Inputs**
+- s: The input string containing a 32-bit floating point number.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_f32_example :: proc() {
+		n, ok := strconv.parse_f32("1234eee")
+		fmt.printfln("%.3f %v", n, ok)
+
+		n, ok = strconv.parse_f32("5678e2")
+		fmt.printfln("%.3f %v", n, ok)
+	}
+
+Output:
+
+	0.000 false
+	567800.000 true
+
+**Returns**
+- value: The parsed 32-bit floating point number.
+- ok: `false` if a base 10 float could not be found, or if the input string contained more than just the number.
+*/
+parse_f32 :: proc(s: string, n: ^int = nil) -> (value: f32, ok: bool) {
+	nr: int
+	value, nr, ok = parse_f32_prefix(s)
+	if ok && len(s) != nr {
+		ok = false
+	}
+	if n != nil { n^ = nr }
+	return
+}
+/*
+Parses a 64-bit floating point number from a string
+
+**Inputs**
+- str: The input string containing a 64-bit floating point number.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_f64_example :: proc() {
+		n, ok := strconv.parse_f64("1234eee")
+		fmt.printfln("%.3f %v", n, ok)
+
+		n, ok = strconv.parse_f64("5678e2")
+		fmt.printfln("%.3f %v", n, ok)
+	}
+
+Output:
+
+	0.000 false
+	567800.000 true
+
+**Returns**
+- value: The parsed 64-bit floating point number.
+- ok: `false` if a base 10 float could not be found, or if the input string contained more than just the number.
+*/
+parse_f64 :: proc(str: string, n: ^int = nil) -> (value: f64, ok: bool) {
+	nr: int
+	value, nr, ok = parse_f64_prefix(str)
+	if ok && len(str) != nr {
+		ok = false
+	}
+	if n != nil { n^ = nr }
+	return
+}
+/*
+Parses a 32-bit floating point number from a string and returns the parsed number, the length of the parsed substring, and a boolean indicating whether the parsing was successful
+
+**Inputs**
+- str: The input string containing a 32-bit floating point number.
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_f32_prefix_example :: proc() {
+		n, _, ok := strconv.parse_f32_prefix("1234eee")
+		fmt.printfln("%.3f %v", n, ok)
+
+		n, _, ok = strconv.parse_f32_prefix("5678e2")
+		fmt.printfln("%.3f %v", n, ok)
+	}
+
+Output:
+
+	0.000 false
+	567800.000 true
+
+
+**Returns**
+- value: The parsed 32-bit floating point number.
+- nr: The length of the parsed substring.
+- ok: A boolean indicating whether the parsing was successful.
+*/
+parse_f32_prefix :: proc(str: string) -> (value: f32, nr: int, ok: bool) {
+	return parse_float_prefix_generic(f32, str)
+}
+/*
+Parses a 64-bit floating point number from a string and returns the parsed number, the length of the parsed substring, and a boolean indicating whether the parsing was successful
+
+**Inputs**
+- str: The input string containing a 64-bit floating point number.
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_f64_prefix_example :: proc() {
+		n, _, ok := strconv.parse_f64_prefix("12.34eee")
+		fmt.printfln("%.3f %v", n, ok)
+
+		n, _, ok = strconv.parse_f64_prefix("12.34e2")
+		fmt.printfln("%.3f %v", n, ok)
+
+		n, _, ok = strconv.parse_f64_prefix("13.37 hellope")
+		fmt.printfln("%.3f %v", n, ok)
+	}
+
+Output:
+
+	0.000 false
+	1234.000 true
+	13.370 true
+
+**Returns**
+- value: The parsed 64-bit floating point number.
+- nr: The length of the parsed substring.
+- ok: `false` if a base 10 float could not be found
+*/
+parse_f64_prefix :: proc(str: string) -> (value: f64, nr: int, ok: bool) {
+	return parse_float_prefix_generic(f64, str)
+}
+
+// Parses directly to `T`, so the result is correctly rounded for both `f32` and `f64`.
+parse_float_prefix_generic :: proc($T: typeid, str: string) -> (value: T, nr: int, ok: bool) where T == f32 || T == f64 {
+	common_prefix_len_ignore_case :: proc "contextless" (s, prefix: string) -> int {
+		n := len(prefix)
+		if n > len(s) {
+			n = len(s)
+		}
+		for i in 0..<n {
+			c := s[i]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != prefix[i] {
+				return i
+			}
+		}
+		return n
+	}
+	check_special :: proc "contextless" (s: string) -> (f: f64, n: int, ok: bool) {
+		s := s
+		if len(s) > 0 {
+			sign := 1
+			nsign := 0
+			switch s[0] {
+			case '+', '-':
+				if s[0] == '-' {
+					sign = -1
+				}
+				nsign = 1
+				s = s[1:]
+				fallthrough
+			case 'i', 'I':
+				m := common_prefix_len_ignore_case(s, "infinity")
+				if 3 <= m && m < 9 { // "inf" to "infinity"
+					f = 0h7ff00000_00000000 if sign == 1 else 0hfff00000_00000000
+					if m == 8 {
+						// We only count the entire prefix if it is precisely "infinity".
+						n = nsign + m
+					} else {
+						// The string was either only "inf" or incomplete.
+						n = nsign + 3
+					}
+					ok = true
+					return
+				}
+			case 'n', 'N':
+				if common_prefix_len_ignore_case(s, "nan") == 3 {
+					f = 0h7ff80000_00000001
+					n = nsign + 3
+					ok = true
+					return
+				}
+			}
+		}
+		return
+	}
+
+	// 0h string to float case
+	@(cold)
+	parse_0h :: proc "contextless" ($F: typeid, str: string) -> (value: F, nr: int, ok: bool) {
+		as_int: u64
+		digits: int
+		i := 2
+		// Read 8 hex digits at a time, then 4 digits at a time (like "0h3c00" or groups
+		// between `_` separators), then single digits and `_` separators.
+		when FAST_FLOAT {
+			for i+8 <= len(str) {
+				v := read8_to_u64(str, i)
+				if !is_eight_hex_digits(v) {
+					break
+				}
+				as_int = as_int<<32 | parse_eight_hex_digits(v)
+				digits += 8
+				i += 8
+			}
+		}
+		for i < len(str) {
+			when FAST_FLOAT {
+				if i+4 <= len(str) {
+					// Four digits: pad them with "0000" and use the 8-digit code.
+					v := u64(read4_to_u32(str, i)) | 0x3030_3030 << 32
+					if is_eight_hex_digits(v) {
+						as_int = as_int<<16 | parse_eight_hex_digits(v) >> 16
+						digits += 4
+						i += 4
+						continue
+					}
+				}
+			}
+			if str[i] != '_' {
+				v := hex_digit_table[str[i]]
+				if v >= 16 {
+					break
+				}
+				as_int = as_int<<4 | u64(v)
+				digits += 1
+			}
+			i += 1
+		}
+		nr = i
+		ok = len(str) == nr
+
+		switch digits {
+		case 4:
+			value = cast(F)transmute(f16)cast(u16)as_int
+		case 8:
+			value = cast(F)transmute(f32)cast(u32)as_int
+		case 16:
+			value = cast(F)transmute(f64)as_int
+		case:
+			ok = false
+		}
+		return
+	}
+
+	@(cold)
+	parse_special :: proc "contextless" ($F: typeid, str: string) -> (value: F, nr: int, ok: bool) {
+		f: f64
+		f, nr, ok = check_special(str)
+		return F(f), nr, ok
+	}
+
+	@(cold)
+	parse_slow :: proc($F: typeid, str: string, info: ^Float_Info) -> (value: F, ok: bool) {
+		when F == f64 { Bits :: u64 } else { Bits :: u32 }
+		d: decimal.Decimal
+		decimal.set(&d, str)
+		b, overflow := decimal_to_float_bits(&d, info)
+		return transmute(F)Bits(b), !overflow
+	}
+
+	if len(str) > 2 && str[0] == '0' && str[1] == 'h' {
+		return parse_0h(T, str)
+	}
+
+	when T == f64 {
+		Bits :: u64
+		info := &_f64_info
+	} else {
+		Bits :: u32
+		info := &_f32_info
+	}
+
+	mantissa: u64
+	exp:      int
+	neg, trunc: bool
+	mantissa, exp, neg, trunc, nr, ok = parse_number_string(str)
+	if !ok {
+		// Not a decimal number: try a hexadecimal float, then "inf" and "nan".
+		mantissa, exp, neg, trunc, nr, ok = scan_hex_float(str)
+		if !ok {
+			return parse_special(T, str)
+		}
+		b, in_range := hex_float_bits(mantissa, exp, neg, trunc, info)
+		return transmute(T)Bits(b), nr, in_range
+	}
+
+	// Clinger's fast path algorithm
+	clinger_fast_path: if !trunc && !(ODIN_ARCH == .i386 && ODIN_OS != .Windows) {
+		@(static, rodata) pow10 := [?]f64{
+			1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+			1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+			1e20, 1e21, 1e22,
+		}
+
+		// Every integer up to 2^53 is an exact f64 value.
+		if mantissa > 1<<53 {
+			break clinger_fast_path
+		}
+		f := f64(mantissa)
+		switch {
+		case exp == 0:
+		case exp > 0 && exp <= 15+22:
+			e := exp
+			if e > 22 {
+				f *= pow10[e-22]
+				e = 22
+				if f > 1e15 {
+					break clinger_fast_path
+				}
+			}
+			f *= pow10[e]
+		case -22 <= exp && exp < 0:
+			f /= pow10[-exp]
+		case:
+			break clinger_fast_path
+		}
+		when T == f32 {
+			// Every f32 midpoint is an f64 value, so rounding to f64 cannot
+			// move the result past a midpoint. The conversion to f32 is then
+			// correct, unless the f64 result is exactly a midpoint.
+			if transmute(u64)f & (1<<29 - 1) == 1<<28 {
+				break clinger_fast_path
+			}
+		}
+		if neg {
+			f = -f
+		}
+		return T(f), nr, true
+	}
+
+	// Eisel-Lemire's fast float algorithm
+	when FAST_FLOAT {
+		fast_float: {
+			b := fast_float_compute_float(T, exp, mantissa)
+			if trunc && b != fast_float_compute_float(T, exp, mantissa+1) {
+				break fast_float
+			}
+			ok = b >> info.mantbits != 1<<info.expbits - 1 // infinity means overflow
+			if neg {
+				b |= 1 << info.mantbits << info.expbits
+			}
+			return transmute(T)Bits(b), nr, ok
+		}
+	}
+
+	value, ok = parse_slow(T, str[:nr], info)
+	return
+}
+/*
+Parses a 128-bit complex number from a string
+
+**Inputs**
+- str: The input string containing a 128-bit complex number.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_complex128_example :: proc() {
+		n: int
+		c, ok := strconv.parse_complex128("3+1i", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+
+		c, ok = strconv.parse_complex128("5+7i hellope", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+	}
+
+Output:
+
+	3+1i 4 true
+	5+7i 4 false
+
+**Returns**
+- value: The parsed 128-bit complex number.
+- ok: `false` if a complex number could not be found, or if the input string contained more than just the number.
+*/
+parse_complex128 :: proc(str: string, n: ^int = nil) -> (value: complex128, ok: bool) {
+	real_value, imag_value: f64
+	nr_r, nr_i: int
+
+	real_value, nr_r, _ = parse_f64_prefix(str)
+	imag_value, nr_i, _ = parse_f64_prefix(str[nr_r:])
+
+	i_parsed := len(str) >= nr_r + nr_i + 1 && str[nr_r + nr_i] == 'i'
+	if !i_parsed {
+		// No `i` means we refuse to treat the second float we parsed as an
+		// imaginary value.
+		imag_value = 0
+		nr_i = 0
+	}
+
+	ok = i_parsed && len(str) == nr_r + nr_i + 1
+
+	if n != nil {
+		n^ = nr_r + nr_i + (1 if i_parsed else 0)
+	}
+
+	value = complex(real_value, imag_value)
+	return
+}
+/*
+Parses a 64-bit complex number from a string
+
+**Inputs**
+- str: The input string containing a 64-bit complex number.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_complex64_example :: proc() {
+		n: int
+		c, ok := strconv.parse_complex64("3+1i", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+
+		c, ok = strconv.parse_complex64("5+7i hellope", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+	}
+
+Output:
+
+	3+1i 4 true
+	5+7i 4 false
+
+**Returns**
+- value: The parsed 64-bit complex number.
+- ok: `false` if a complex number could not be found, or if the input string contained more than just the number.
+*/
+parse_complex64 :: proc(str: string, n: ^int = nil) -> (value: complex64, ok: bool) {
+	v: complex128 = ---
+	v, ok = parse_complex128(str, n)
+	return cast(complex64)v, ok
+}
+/*
+Parses a 32-bit complex number from a string
+
+**Inputs**
+- str: The input string containing a 32-bit complex number.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_complex32_example :: proc() {
+		n: int
+		c, ok := strconv.parse_complex32("3+1i", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+
+		c, ok = strconv.parse_complex32("5+7i hellope", &n)
+		fmt.printfln("%v %i %t", c, n, ok)
+	}
+
+Output:
+
+	3+1i 4 true
+	5+7i 4 false
+
+**Returns**
+- value: The parsed 32-bit complex number.
+- ok: `false` if a complex number could not be found, or if the input string contained more than just the number.
+*/
+parse_complex32 :: proc(str: string, n: ^int = nil) -> (value: complex32, ok: bool) {
+	v: complex128 = ---
+	v, ok = parse_complex128(str, n)
+	return cast(complex32)v, ok
+}
+/*
+Parses a 256-bit quaternion from a string
+
+**Inputs**
+- str: The input string containing a 256-bit quaternion.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_quaternion256_example :: proc() {
+		n: int
+		q, ok := strconv.parse_quaternion256("1+2i+3j+4k", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+
+		q, ok = strconv.parse_quaternion256("1+2i+3j+4k hellope", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+	}
+
+Output:
+
+	1+2i+3j+4k 10 true
+	1+2i+3j+4k 10 false
+
+**Returns**
+- value: The parsed 256-bit quaternion.
+- ok: `false` if a quaternion could not be found, or if the input string contained more than just the quaternion.
+*/
+parse_quaternion256 :: proc(str: string, n: ^int = nil) -> (value: quaternion256, ok: bool) {
+	iterate_and_assign :: proc (iter: ^string, terminator: byte, nr_total: ^int, state: bool) -> (value: f64, ok: bool) {
+		if !state {
+			return
+		}
+
+		nr: int
+		value, nr, _ = parse_f64_prefix(iter^)
+		iter^ = iter[nr:]
+
+		if len(iter) > 0 && iter[0] == terminator {
+			iter^ = iter[1:]
+			nr_total^ += nr + 1
+			ok = true
+		} else {
+			value = 0
+		}
+
+		return
+	}
+
+	real_value, imag_value, jmag_value, kmag_value: f64
+	nr: int
+
+	real_value, nr, _ = parse_f64_prefix(str)
+	iter := str[nr:]
+
+	// Need to have parsed at least something in order to get started.
+	ok = nr > 0
+
+	// Quaternion parsing is done this way to honour the rest of the API with
+	// regards to partial parsing. Otherwise, we could error out early.
+	imag_value, ok = iterate_and_assign(&iter, 'i', &nr, ok)
+	jmag_value, ok = iterate_and_assign(&iter, 'j', &nr, ok)
+	kmag_value, ok = iterate_and_assign(&iter, 'k', &nr, ok)
+
+	if len(iter) != 0 {
+		ok = false
+	}
+
+	if n != nil {
+		n^ = nr
+	}
+
+	value = quaternion(
+		real = real_value,
+		imag = imag_value,
+		jmag = jmag_value,
+		kmag = kmag_value)
+	return
+}
+/*
+Parses a 128-bit quaternion from a string
+
+**Inputs**
+- str: The input string containing a 128-bit quaternion.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_quaternion128_example :: proc() {
+		n: int
+		q, ok := strconv.parse_quaternion128("1+2i+3j+4k", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+
+		q, ok = strconv.parse_quaternion128("1+2i+3j+4k hellope", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+	}
+
+Output:
+
+	1+2i+3j+4k 10 true
+	1+2i+3j+4k 10 false
+
+**Returns**
+- value: The parsed 128-bit quaternion.
+- ok: `false` if a quaternion could not be found, or if the input string contained more than just the quaternion.
+*/
+parse_quaternion128 :: proc(str: string, n: ^int = nil) -> (value: quaternion128, ok: bool) {
+	v: quaternion256 = ---
+	v, ok = parse_quaternion256(str, n)
+	return cast(quaternion128)v, ok
+}
+/*
+Parses a 64-bit quaternion from a string
+
+**Inputs**
+- str: The input string containing a 64-bit quaternion.
+- n: An optional pointer to an int to store the length of the parsed substring (default: nil).
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	parse_quaternion64_example :: proc() {
+		n: int
+		q, ok := strconv.parse_quaternion64("1+2i+3j+4k", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+
+		q, ok = strconv.parse_quaternion64("1+2i+3j+4k hellope", &n)
+		fmt.printfln("%v %i %t", q, n, ok)
+	}
+
+Output:
+
+	1+2i+3j+4k 10 true
+	1+2i+3j+4k 10 false
+
+**Returns**
+- value: The parsed 64-bit quaternion.
+- ok: `false` if a quaternion could not be found, or if the input string contained more than just the quaternion.
+*/
+parse_quaternion64 :: proc(str: string, n: ^int = nil) -> (value: quaternion64, ok: bool) {
+	v: quaternion256 = ---
+	v, ok = parse_quaternion256(str, n)
+	return cast(quaternion64)v, ok
+}
+/*
+Writes a boolean value as a string to the given buffer
+
+**Inputs**
+- buf: The buffer to write the boolean value to
+- b: The boolean value to be written
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	write_bool_example :: proc() {
+		buf: [6]byte
+		result := strconv.write_bool(buf[:], true)
+		fmt.println(result, buf)
+	}
+
+Output:
+
+	true [116, 114, 117, 101, 0, 0]
+
+**Returns**
+- The resulting string after writing the boolean value
+*/
+write_bool :: proc(buf: []byte, b: bool) -> string {
+	n := 0
+	if b {
+		n = copy(buf, "true")
+	} else {
+		n = copy(buf, "false")
+	}
+	return string(buf[:n])
+}
+/*
+Writes an unsigned integer value as a string to the given buffer with the specified base
+
+**Inputs**
+- buf: The buffer to write the unsigned integer value to
+- u: The unsigned integer value to be written
+- base: The base to use for converting the integer value
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	write_uint_example :: proc() {
+		buf: [4]byte
+		result := strconv.write_uint(buf[:], 42, 16)
+		fmt.println(result, buf)
+	}
+
+Output:
+
+	2a [50, 97, 0, 0]
+
+**Returns**
+- The resulting string after writing the unsigned integer value
+*/
+write_uint :: proc(buf: []byte, u: u64, base: int) -> string {
+	return write_bits(buf, u, base, false, 8*size_of(uint), digits, nil)
+}
+/*
+Writes a signed integer value as a string to the given buffer with the specified base
+
+**Inputs**
+- buf: The buffer to write the signed integer value to
+- i: The signed integer value to be written
+- base: The base to use for converting the integer value
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	write_int_example :: proc() {
+		buf: [4]byte
+		result := strconv.write_int(buf[:], -42, 10)
+		fmt.println(result, buf)
+	}
+
+Output:
+
+	-42 [45, 52, 50, 0]
+
+**Returns**
+- The resulting string after writing the signed integer value
+*/
+write_int :: proc(buf: []byte, i: i64, base: int) -> string {
+	return write_bits(buf, u64(i), base, true, 8*size_of(int), digits, nil)
+}
+
+
+
+write_u128 :: proc(buf: []byte, u: u128, base: int) -> string {
+	return write_bits_128(buf, u, base, false, 8*size_of(uint), digits, nil)
+}
+
+/*
+`ftoa` C name deprecated, use `write_float` instead (same procedure)
+
+Writes a float64 value as a string to the given buffer with the specified format and precision
+
+**Inputs**
+- buf: The buffer to write the float64 value to
+- f: The float64 value to be written
+- fmt: The byte specifying the format to use for the conversion
+- prec: The precision to use for the conversion
+- bit_size: The size of the float in bits (16, 32, or 64)
+- flags: Additional formatting options.
+         The default value adds a '+' sign for positive finite values, for compatibility reasons.
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	write_float_example :: proc() {
+		buf: [8]byte
+		result := strconv.write_float(buf[:], 3.14159, 'f', 2, 64)
+		fmt.println(result, buf)
+	}
+
+Output:
+
+	+3.14 [43, 51, 46, 49, 52, 0, 0, 0]
+
+Pass `nil` for `flags` to format the same value as `3.14`.
+
+**Returns**
+- The resulting string after writing the float
+*/
+write_float :: proc(buf: []byte, f: f64, fmt: byte, prec, bit_size: int, flags: Float_Flags = { .Plus }) -> string {
+	return string(generic_ftoa(buf, f, fmt, prec, bit_size, flags))
+}
+// Accepts '0'..='9', otherwise returns ok = false
+digit_to_int :: proc(r: rune) -> (value: int, ok: bool) {
+	if '0' <= r && r <= '9' {
+		return int(r - '0'), true
+	}
+	return -1, false
+}
+
+
+/*
+	Helper functions for placing content into a byte buffer.
+	These take a `^i` as cursor, and advance it by how many bytes have been written.
+*/
+
+
+/*
+	Places a single byte into `buf` at position `i^`, and advances `i^` by how many bytes have been written.
+
+	Returns `true` on success, `false` if `buf` was not large enough.
+*/
+_write_byte :: #force_inline proc(buf: []byte, i: ^int, b: byte) -> bool {
+	if i^ < len(buf) {
+		buf[i^] = b
+		i^ += 1
+		return true
+	} else {
+		return false
+	}
+}
+
+
+/*
+	Places bytes in `s` into `buf` at position `i^`, and advances `i^` by how many bytes have been written.
+
+	The bytes in the string are taken as they are, no further processing is done.
+
+	Returns `true` on success, `false` if `buf` was not large enough.
+*/
+_write_string :: #force_inline proc(buf: []byte, i: ^int, s: string) -> bool {
+	if i^ < len(buf) {
+		n := copy(buf[i^:], s)
+		i^ += n
+		return n == len(s)
+	} else {
+		return false
+	}
+}
+
+/*
+	Encodes a single rune as UTF-8 and escapes it if appropriate,
+	and places the encoded bytes into `buf` at position `i^`, and advances `i^` by how many bytes have been written.
+
+	Returns `true` on success, `false` if `buf` was not large enough.
+
+	NOTE: The maximum number of bytes written to `buf` is 10 (`ESCAPED_RUNE_MAX_NEEDED_BYTES`).
+
+	If the input rune is invalid, this will write a Unicode replacement character instead.
+*/
+_write_rune :: proc(buf: []byte, i: ^int, r: rune, quote_char: byte, options: Rune_Escaping_Options) -> bool {
+
+	if len(buf) <= i^ {
+		return false
+	}
+
+	r := r
+
+	if r < 0 || r > utf8.MAX_RUNE || (utf8.SURROGATE_MIN <= r && r <= utf8.SURROGATE_MAX) {
+		// Invalid input.
+		r = unicode.REPLACEMENT_CHAR
+	}
+
+	if r == '\\' || (r == cast(rune)quote_char && quote_char != 0) {
+		_write_byte(buf, i, '\\') or_return
+		_write_byte(buf, i, byte(r)) or_return
+		return true
+	}
+
+	if .html_safe in options {
+		switch r {
+		case '<', '>', '&':
+			_write_string(buf, i, `\x`) or_return
+			_write_hex_code(buf, i, cast(u32)r, 2) or_return
+			return true
+		}
+	}
+
+	if unicode.is_printable(r) && (r <= 0x7f || (.ascii_compatible not_in options)) {
+		b, w := utf8.encode_rune(r)
+		n := copy(buf[i^:], b[:w])
+		i^ += n
+		return n == w
+	}
+
+	switch r {
+	case '\a': _write_string(buf, i, `\a`) or_return
+	case '\b': _write_string(buf, i, `\b`) or_return
+	case '\e': _write_string(buf, i, `\e`) or_return
+	case '\f': _write_string(buf, i, `\f`) or_return
+	case '\n': _write_string(buf, i, `\n`) or_return
+	case '\r': _write_string(buf, i, `\r`) or_return
+	case '\t': _write_string(buf, i, `\t`) or_return
+	case '\v': _write_string(buf, i, `\v`) or_return
+	case:
+		// Print it in escaped form:
+		//  \x##  -or-  \u####  -or-  \U########
+		if r <= 0xff {
+			// \x##
+			_write_string(buf, i, `\x`) or_return
+			_write_hex_code(buf, i, cast(u32)r, 2) or_return
+		} else if r <= 0xffff {
+			// \u####
+			_write_string(buf, i, `\u`) or_return
+			_write_hex_code(buf, i, cast(u32)r, 4) or_return
+		} else {
+			// \U########
+			_write_string(buf, i, `\U`) or_return
+			_write_hex_code(buf, i, cast(u32)r, 8) or_return
+		}
+	}
+
+	return true
+}
+
+
+/*
+	Places a hexadecimal integer, padded with '0' to width `w`, into `buf` at position `i^`, and advances
+	`i^` by how many bytes have been written.
+
+	Digits that would exceed width `w` are dropped.
+
+	This is mainly for writing escaped unicode sequences like `\x12`, `\u1234`, `\U12345678`.
+
+	Returns `true` on success, `false` if `buf` was not large enough.
+*/
+_write_hex_code :: proc(buf: []byte, i: ^int, r: u32, w: int) -> bool {
+	if len(buf) - i^ < w {
+		return false
+	}
+	assert(len(digits) >= 16)
+	#no_bounds_check {
+		for j in 0 ..< w {
+			buf[i^ + j] = digits[r >> cast(uint)(4 * (w - 1 - j)) & 0xf]
+		}
+	}
+	i^ += w
+	return true
+}
+
+
+/*
+	Writes string `str` to byte buffer `buf`, and returns the written bytes as a string.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted string will be written.
+	- `str`:      The input string to be quoted.
+
+	**Returns**
+	- `result`:   The resulting string after writing it to the buffer.
+	              May be clipped if `buf` was not large enough.
+	- `ok`:       `true` on success; `false` if `buf` was not large enough.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote_string_buf(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+*/
+write_string :: proc(buf: []byte, str: string) -> (result: string, ok: bool) #optional_ok {
+	n := copy(buf, str)
+	result = transmute(string)buf[:n]
+	ok = (n == len(str))
+	return
+}
+
+
+write_string16 :: proc { write_string16_buf, write_string16_dynamic_array }
+
+
+/*
+	Writes UTF-16 encoded string `str`, converted to UTF-8 to byte buffer `buf`, and returns the written bytes as a string.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted string will be written.
+	- `str`:      The input string to be quoted.
+
+	**Returns**
+	- `result`:   The resulting string after writing it to the buffer.
+	              May be clipped if `buf` was not large enough.
+	- `ok`:       `true` on success; `false` if `buf` was not large enough.
+
+	**Remarks**
+
+	Unpaired UTF-16 surrogates are encoded as the Unicode replacement character. The UTF-16 decoder does not
+	distinguish malformed sequences from literal replacement characters, so both are written identically.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote_string_buf(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+*/
+write_string16_buf :: proc(buf: []byte, str: string16) -> (result: string, ok: bool) #optional_ok {
+	n := 0
+	ok = true
+	s := str
+	for len(s) > 0 {
+		r, decoded_width := utf16.decode_rune_in_string(s)
+		assert(decoded_width > 0)
+		encoded_bytes, encoded_width := utf8.encode_rune(r)
+		num_copied := copy(buf[n:], encoded_bytes[:encoded_width])
+		n += num_copied
+		if num_copied != encoded_width {
+			// Buffer not large enough.
+			ok = false
+			break
+		}
+		s = s[decoded_width:]
+	}
+	result = transmute(string)buf[:n]
+	return
+}
+
+
+/*
+	Appends UTF-16 encoded string `str`, converted to UTF-8, to the end of `buf`, and returns appended bytes as a string.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted string will be written.
+	- `str`:      The input string to be quoted.
+
+	**Returns**
+	- `result`:   The resulting string after writing it to the buffer.
+	              May be clipped if `buf` was not large enough.
+	- `err`:      Allocator error if one occurred, otherwise `nil`.
+
+	**Remarks**
+
+	Unpaired UTF-16 surrogates are encoded as the Unicode replacement character. The UTF-16 decoder does not
+	distinguish malformed sequences from literal replacement characters, so both are written identically.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote_string_buf(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+*/
+write_string16_dynamic_array :: proc(buf: ^[dynamic]byte, str: string16, loc := #caller_location) -> (result: string, err: runtime.Allocator_Error) #optional_allocator_error {
+	n := 0
+	s := str
+	for len(s) > 0 {
+		r, decoded_width := utf16.decode_rune_in_string(s)
+		assert(decoded_width > 0)
+		encoded_bytes, encoded_width := utf8.encode_rune(r)
+		n += append(buf, ..encoded_bytes[:encoded_width], loc=loc) or_return
+		s = s[decoded_width:]
+	}
+	result = transmute(string)buf[len(buf)-n:]
+	return
+}
+
+
+@(deprecated="This will almost certainly not do what you are expecting. If you actually meant to call this, call `quote_weird` instead. Otherwise, you are probably looking for `quote_string`.")
+quote :: proc(buf: []byte, str: string) -> string {
+	return quote_weird(buf, str)
+}
+/*
+	Writes a quoted string representation of the input string to a given byte slice and returns the result as a string
+
+	**Inputs**
+	- buf: The byte slice to which the quoted string will be written
+	- str: The input string to be quoted
+
+	!! ISSUE !! NOT EXPECTED -- `"\"hello\""` was expected
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"'h''e''l''l''o'" [34, 39, 104, 39, 39, 101, 39, 39, 108, 39, 39, 108, 39, 39, 111, 39, 34, 0, 0, 0]
+
+	**Returns**
+	- The resulting string after writing the quoted string representation
+*/
+quote_weird ::  proc(buf: []byte, str: string) -> string {
+	write_byte :: proc(buf: []byte, i: ^int, bytes: ..byte) {
+		if i^ >= len(buf) {
+			return
+		}
+		n := copy(buf[i^:], bytes[:])
+		i^ += n
+	}
+
+	if buf == nil {
+		return ""
+	}
+
+	c :: '"'
+	i := 0
+	s := str
+
+	write_byte(buf, &i, c)
+	for width := 0; len(s) > 0; s = s[width:] {
+		r := rune(s[0])
+		width = 1
+		if r >= utf8.RUNE_SELF {
+			r, width = utf8.decode_rune_in_string(s)
+		}
+		if width == 1 && r == utf8.RUNE_ERROR {
+			write_byte(buf, &i, '\\', 'x')
+			write_byte(buf, &i, digits[s[0]>>4])
+			write_byte(buf, &i, digits[s[0]&0xf])
+		}
+		// No else !?
+		if i < len(buf) {
+			x := quote_rune(buf[i:], r)
+			i += len(x)
+		}
+	}
+	write_byte(buf, &i, c)
+	return string(buf[:i])
+}
+
+
+/*
+	Writes a quoted string representation of the input string to a given byte buffer, and returns the result as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+*/
+quote_string :: proc { quote_string_buf, quote_string_dynamic_array }
+
+
+/*
+	Writes a quoted string representation of the input string to byte buffer `buf`, and returns the result as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted string will be written.
+	- `str`:      The input string to be quoted.
+	- `quote`:    The quote character used to surround the string. This character is also escaped
+	              when it is encountered in the string.
+	- `options`:  Controls how characters in the string are escaped.
+
+	**Returns**
+	- `result`:   The resulting string after writing the quoted string representation.
+	- `ok`:       `true` on success; `false` if `buf` was not large enough.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote_string_buf(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+*/
+quote_string_buf :: proc(
+	buf:      []byte,
+	str:      string,
+	quote:    byte = '"',
+	options:  Rune_Escaping_Options = nil,
+) -> (result: string, ok: bool) #optional_ok {
+	i := 0
+
+	_write_byte(buf, &i, quote) or_return
+
+	s := str
+
+	for len(s) > 0 {
+		r := cast(rune)s[0]
+		width := 1
+		if r < utf8.RUNE_SELF {
+			// r contains the entire UTF-8 codepoint already.
+		} else {
+			// Multi-byte codepoint. Must decode.
+			r, width = utf8.decode_rune_in_string(s)
+			assert(width > 0)
+		}
+		if width == 1 && r == utf8.RUNE_ERROR {
+			// Indicates UTF-8 encoding error.
+			// Encode the byte exactly as it was found in the input string: `\x##`
+			_write_string(buf, &i, `\x`) or_return
+			_write_byte(buf, &i, digits[s[0] >> 4]) or_return
+			_write_byte(buf, &i, digits[s[0] & 0xf]) or_return
+		} else {
+			encoded := encode_and_escape_rune(buf[i:], r, quote, options = options) or_return
+			i += len(encoded)
+		}
+		// Advance input cursor to the next codepoint.
+		s = s[width:]
+	}
+
+	_write_byte(buf, &i, quote) or_return
+	result = transmute(string)buf[:i]
+	ok = true
+	return
+}
+
+
+/*
+	Appends a quoted string representation of the input string to the end of `buf`, and returns the appended part as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+
+	**Inputs**
+	- `buf`:      The dynamic array to which the quoted string will be appended.
+	- `str`:      The input string to be quoted.
+	- `quote`:    The quote character used to surround the string. This character is also escaped
+	              when it is encountered in the string.
+	- `options`:  Controls how characters in the string are escaped.
+
+	**Returns**
+	- `result`:   The resulting string after writing the quoted string representation.
+	- `err`:      Allocator error if one occurred, otherwise `nil`.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [dynamic]byte
+			result := strconv.quote_string_dynamic_array(&buf, "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34]
+*/
+quote_string_dynamic_array :: proc(
+	buf:      ^[dynamic]byte,
+	str:      string,
+	quote:    byte = '"',
+	options:  Rune_Escaping_Options = nil,
+	loc := #caller_location,
+) -> (result: string, err: runtime.Allocator_Error) #optional_allocator_error {
+	n := 0
+	n += append(buf, quote, loc=loc) or_return
+
+	s := str
+
+	for len(s) > 0 {
+		r := cast(rune)s[0]
+		width := 1
+		if r < utf8.RUNE_SELF {
+			// r contains the entire UTF-8 codepoint already.
+		} else {
+			// Multi-byte codepoint. Must decode.
+			r, width = utf8.decode_rune_in_string(s)
+			assert(width > 0)
+		}
+		if width == 1 && r == utf8.RUNE_ERROR {
+			// Indicates UTF-8 encoding error.
+			// Encode the byte exactly as it was found in the input string: `\x##`
+			n += append(buf, `\x`, loc=loc) or_return
+			n += append(buf, digits[s[0] >> 4], loc=loc) or_return
+			n += append(buf, digits[s[0] & 0xf], loc=loc) or_return
+		} else {
+			// CONSIDER: ensure ESCAPED_RUNE_MAX_NEEDED_BYTES bytes free capacity in buf, and put it there directly?
+			encoded_rune_buf: [ESCAPED_RUNE_MAX_NEEDED_BYTES]byte
+			encoded_rune, encode_rune_ok := encode_and_escape_rune(encoded_rune_buf[:], r, quote, options = options)
+			assert(encode_rune_ok == true, "encode_rune should have worked - 10 bytes should be enough to accomodate for any encoded rune representation (max. = \"\\U########\").")
+			n += append(buf, encoded_rune, loc=loc) or_return
+		}
+		// Advance input cursor to the next codepoint.
+		s = s[width:]
+	}
+
+	n += append(buf, quote, loc=loc) or_return
+	result = transmute(string)buf[len(buf)-n:]
+	return
+}
+
+
+/*
+	Writes a quoted string representation of the UTF-16 input string, converted to UTF-8, to a given byte buffer, and returns the result as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+*/
+quote_string16 :: proc { quote_string16_buf, quote_string16_dynamic_array }
+
+
+/*
+	Writes a quoted string representation of the UTF-16 input string to byte buffer `buf`, and returns the result as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+
+	**Note:** The output string is encoded as UTF-8.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted string will be written.
+	- `str`:      The input string to be quoted.
+	- `quote`:    The quote character used to surround the string. This character is also escaped
+	              when it is encountered in the string.
+	- `options`:  Controls how characters in the string are escaped.
+
+	**Returns**
+	- `result`:   The resulting string after writing the quoted string representation.
+	- `ok`:       `true` on success; `false` if `buf` was not large enough.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [20]byte
+			result := strconv.quote_string_buf(buf[:], "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+*/
+quote_string16_buf :: proc(
+	buf:      []byte,
+	str:      string16,
+	quote:    byte = '"',
+	options:  Rune_Escaping_Options = nil,
+) -> (result: string, ok: bool) #optional_ok {
+	i := 0
+
+	_write_byte(buf, &i, quote) or_return
+
+	s := str
+
+	for len(s) > 0 {
+		r, width := utf16.decode_rune_in_string(s)
+		assert(width > 0)
+		encoded := encode_and_escape_rune(buf[i:], r, quote, options = options) or_return
+		i += len(encoded)
+		// Advance input cursor to the next codepoint.
+		s = s[width:]
+	}
+
+	_write_byte(buf, &i, quote) or_return
+	result = transmute(string)buf[:i]
+	ok = true
+	return
+}
+
+
+/*
+	Appends a quoted string representation of the UTF-16 input string to the end of `buf`, and returns the appended part as a string.
+
+	The string is formatted such that it would parse back as the same string in Odin syntax.
+
+	**Note:** The output string is encoded as UTF-8.
+
+	**Inputs**
+	- `buf`:      The dynamic array to which the quoted string will be appended.
+	- `str`:      The input string to be quoted.
+	- `quote`:    The quote character used to surround the string. This character is also escaped
+	              when it is encountered in the string.
+	- `options`:  Controls how characters in the string are escaped.
+
+	**Returns**
+	- `result`:   The resulting string after writing the quoted string representation.
+	- `err`:      Allocator error if one occurred, otherwise `nil`.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_example :: proc() {
+			buf: [dynamic]byte
+			result := strconv.quote_string_dynamic_array(&buf, "hello")
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		"hello" [34, 104, 101, 108, 108, 111, 34]
+*/
+quote_string16_dynamic_array :: proc(
+	buf:      ^[dynamic]byte,
+	str:      string16,
+	quote:    byte = '"',
+	options:  Rune_Escaping_Options = nil,
+	loc := #caller_location,
+) -> (result: string, err: runtime.Allocator_Error) #optional_allocator_error {
+	n := 0
+	n += append(buf, quote, loc=loc) or_return
+
+	s := str
+
+	for len(s) > 0 {
+		r, width := utf16.decode_rune_in_string(s)
+		assert(width > 0)
+		// CONSIDER: ensure ESCAPED_RUNE_MAX_NEEDED_BYTES bytes free capacity in buf, and put it there directly?
+		encoded_rune_buf: [ESCAPED_RUNE_MAX_NEEDED_BYTES]byte
+		encoded_rune, encode_rune_ok := encode_and_escape_rune(encoded_rune_buf[:], r, quote, options = options)
+		assert(encode_rune_ok == true, "encode_rune should have worked - 10 bytes should be enough to accomodate for any encoded rune representation (max. = \"\\U########\").")
+		n += append(buf, encoded_rune, loc=loc) or_return
+		// Advance input cursor to the next codepoint.
+		s = s[width:]
+	}
+
+	n += append(buf, quote, loc=loc) or_return
+	result = transmute(string)buf[len(buf)-n:]
+	return
+}
+
+
+/*
+	Maximum number of free buffer bytes needed by `encode_and_escape_rune` in the worst case,
+	which is `\U########`.
+*/
+ESCAPED_RUNE_MAX_NEEDED_BYTES  :: 10
+
+
+/*
+	Maximum number of free buffer bytes needed by `quote_rune` in the worst case.
+*/
+QUOTED_RUNE_MAX_NEEDED_BYTES   :: ESCAPED_RUNE_MAX_NEEDED_BYTES + 2
+
+
+/*
+	Writes a quoted rune representation of the input rune, encoded as UTF-8, to a given byte slice and returns the result as a string.
+
+	**Inputs**
+	- `buf`:      The byte slice to which the quoted rune will be written.
+	- `r`:        The input rune to be quoted.
+	- `options`:  Controls how characters in the string are escaped.
+
+	**Returns**
+	- `result`:   On success, the resulting string after writing the quoted rune representation.
+	              Otherwise, the procedure will return `""` instead.
+	- `ok`:       `true` on success; `false` if `buf` was not large enough.
+
+	**Remarks**
+
+	The rune is quoted such that it would parse back as a valid rune literal in Odin syntax.
+
+	This implies that single quotes (`'`) are used.
+
+	Example:
+
+		import "core:fmt"
+		import "core:strconv"
+		quote_rune_example :: proc() {
+			buf: [4]byte
+			result := strconv.quote_rune(buf[:], 'A')
+			fmt.println(result, buf)
+		}
+
+	Output:
+
+		'A' [39, 65, 39, 0]
+*/
+quote_rune :: proc(
+	buf: []byte,
+	r: rune,
+	options: Rune_Escaping_Options = nil,
+) -> (result: string, ok: bool) #optional_ok {
+	if buf == nil {
+		return "", false
+	}
+
+	i := 0
+	_write_byte(buf, &i, '\'') or_return
+	_write_rune(buf, &i, r, quote_char = '\'', options = options) or_return
+	_write_byte(buf, &i, '\'') or_return
+
+	return string(buf[:i]), true
+}
+
+
+Rune_Escaping_Option :: enum {
+	// When set, runes will be escaped such that their encoded byte representation
+	// only contains ASCII characters.
+	ascii_compatible,
+
+	// When set, the runes `<`, `>` and `&` will be escaped as `\x3c`, `\x3e` and `\x26` respectively,
+	// making them suitable for text content nodes in HTML (and XML) documents.
+	//
+	// **NOTE:** This does NOT encode them as HTML entities `&lt;`, `&gt;` or `&amp;`.
+	html_safe,
+}
+
+/*
+	Lets callers configure how individual runes are escaped when using:
+	- `quote_rune`
+	- `quote_string_buf`
+	- `quote_string_dynamic_array`
+	- `encode_and_escape_rune`
+*/
+Rune_Escaping_Options :: bit_set[Rune_Escaping_Option]
+
+/*
+	Encodes a single rune `r` as UTF-8, escaping it if appropriate, and palces the result into `buf`.
+
+	**Inputs**
+	- `buf`:         The byte buffer into which the encoded and escaped rune will be written.
+	- `r`:           The rune which should be encoded.
+	- `quote_char`:  A character which this procedure will consider necessary to escape.
+	                 Usually, this is `'` if this is called to encode a single quoted rune (e.g. `'a'`),
+	                 or `"` if this is called to encode runes in a quoted string (e.g. `"abc"`).
+	                 Specify `quote_char = 0` to disable this feature.
+	- `options`:     Specify extended options.
+	
+	**Returns**
+	- `result`:      The encoded and escaped representation of the rune, if successful.
+	- `ok`:          `true` on success, `false` if `buf` was not large enough.
+
+	**Remarks**
+
+	This procedure escapes runes when it would have been appropriate to do so in an Odin string literal. Escaping
+	also follows the rules and syntax of Odin in general.
+
+	This includes, but may not be limited to, control characters, invisible characters, and characters which
+	would likely cause display issues such as combining marks (see: `unicode.is_printable`).
+
+	Invalid code points, including surrogate values, are encoded as the replacement character.
+*/
+encode_and_escape_rune :: proc(buf: []byte, r: rune, quote_char: byte, options: Rune_Escaping_Options = nil) -> (result: string, ok: bool) #optional_ok {
+	if buf == nil {
+		return "", false
+	}
+
+	i := 0
+	_write_rune(buf, &i, r, quote_char, options) or_return
+	return string(buf[:i]), true
+}
+
+
+/*
+Unquotes a single character from the input string, considering the given quote character
+
+**Inputs**
+- str: The input string containing the character to unquote
+- quote: The quote character to consider (e.g., '"')
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	unquote_char_example :: proc() {
+		src:="\'The\' raven"
+		r, multiple_bytes, tail_string, success  := strconv.unquote_char(src,'\'')
+		fmt.println("Source:", src)
+		fmt.printf("r: <%v>, multiple_bytes:%v, tail_string:<%s>, success:%v\n",r, multiple_bytes, tail_string, success)
+	}
+
+Output:
+
+	Source: 'The' raven
+	r: <'>, multiple_bytes:false, tail_string:<The' raven>, success:true
+
+**Returns**
+- r: The unquoted rune
+- multiple_bytes: A boolean indicating if the rune has multiple bytes
+- tail_string: The remaining portion of the input string after unquoting the character
+- success: A boolean indicating whether the unquoting was successful
+*/
+unquote_char :: proc(str: string, quote: byte) -> (r: rune, multiple_bytes: bool, tail_string: string, success: bool) {
+	hex_to_int :: proc(c: byte) -> int {
+		switch c {
+		case '0'..='9': return int(c-'0')
+		case 'a'..='f': return int(c-'a')+10
+		case 'A'..='F': return int(c-'A')+10
+		}
+		return -1
+	}
+	w: int
+
+	if str[0] == quote && quote == '"' {
+		return
+	} else if str[0] >= 0x80 {
+		r, w = utf8.decode_rune_in_string(str)
+		return r, true, str[w:], true
+	} else if str[0] != '\\' {
+		return rune(str[0]), false, str[1:], true
+	}
+
+	if len(str) <= 1 {
+		return
+	}
+	s := str
+	c := s[1]
+	s = s[2:]
+
+	switch c {
+	case:
+		return
+
+	case 'a':  r = '\a'
+	case 'b':  r = '\b'
+	case 'f':  r = '\f'
+	case 'n':  r = '\n'
+	case 'r':  r = '\r'
+	case 't':  r = '\t'
+	case 'v':  r = '\v'
+	case '\\': r = '\\'
+
+	case '"':  r = '"'
+	case '\'': r = '\''
+
+	case '0'..='7':
+		v := int(c-'0')
+		if len(s) < 2 {
+			return
+		}
+		for i in 0..<len(s) {
+			d := int(s[i]-'0')
+			if d < 0 || d > 7 {
+				return
+			}
+			v = (v<<3) | d
+		}
+		s = s[2:]
+		if v > 0xff {
+			return
+		}
+		r = rune(v)
+
+	case 'x', 'u', 'U':
+		count: int
+		switch c {
+		case 'x': count = 2
+		case 'u': count = 4
+		case 'U': count = 8
+		}
+
+		if len(s) < count {
+			return
+		}
+
+		for i in 0..<count {
+			d := hex_to_int(s[i])
+			if d < 0 {
+				return
+			}
+			r = (r<<4) | rune(d)
+		}
+		s = s[count:]
+		if c == 'x' {
+			break
+		}
+		if r > utf8.MAX_RUNE {
+			return
+		}
+		multiple_bytes = true
+	}
+
+	success = true
+	tail_string = s
+	return
+}
+/*
+Unquotes the input string considering any type of quote character and returns the unquoted string
+
+**Inputs**
+- lit: The input string to unquote
+- allocator: (default: context.allocator)
+
+WARNING: This procedure gives unexpected results if the quotes are not the first and last characters.
+
+Example:
+
+	import "core:fmt"
+	import "core:strconv"
+	unquote_string_example :: proc() {
+		src:="\"The raven Huginn is black.\""
+		s, allocated, ok := strconv.unquote_string(src)
+		fmt.println(src)
+		fmt.printf("Unquoted: <%s>, alloc:%v, ok:%v\n\n", s, allocated, ok)
+
+		src="\'The raven Huginn\' is black."
+		s, allocated, ok = strconv.unquote_string(src)
+		fmt.println(src)
+		fmt.printf("Unquoted: <%s>, alloc:%v, ok:%v\n\n", s, allocated, ok)
+
+		src="The raven \'Huginn\' is black."
+		s, allocated, ok = strconv.unquote_string(src) // Will produce undesireable results
+		fmt.println(src)
+		fmt.printf("Unquoted: <%s>, alloc:%v, ok:%v\n", s, allocated, ok)
+	}
+
+Output:
+
+	"The raven Huginn is black."
+	Unquoted: <The raven Huginn is black.>, alloc:false, ok:true
+
+	'The raven Huginn' is black.
+	Unquoted: <The raven Huginn' is black>, alloc:false, ok:true
+
+	The raven 'Huginn' is black.
+	Unquoted: <he raven 'Huginn' is black>, alloc:false, ok:true
+
+**Returns**
+- res: The resulting unquoted string
+- allocated: A boolean indicating if the resulting string was allocated using the provided allocator
+- success: A boolean indicating whether the unquoting was successful
+
+NOTE: If unquoting is unsuccessful, the allocated memory for the result will be freed.
+*/
+unquote_string :: proc(lit: string, allocator := context.allocator) -> (res: string, allocated, success: bool) {
+	contains_rune :: proc(s: string, r: rune) -> int {
+		for c, offset in s {
+			if c == r {
+				return offset
+			}
+		}
+		return -1
+	}
+
+	if len(lit) < 2 {
+		return
+	}
+	if lit[0] == '`' {
+		return lit[1:len(lit)-1], false, true
+	}
+
+	s := lit
+	quote := '"'
+
+	if s == `""` {
+		return "", false, true
+	}
+	s = s[1:len(s)-1]
+
+	if contains_rune(s, '\n') >= 0 {
+		return s, false, false
+	}
+
+	if contains_rune(s, '\\') < 0 && contains_rune(s, quote) < 0 {
+		if quote == '"' {
+			return s, false, true
+		}
+	}
+
+	context.allocator = allocator
+
+	buf_len := 3*len(s) / 2
+	buf := make([]byte, buf_len)
+	offset := 0
+	for len(s) > 0 {
+		r, multiple_bytes, tail_string, ok := unquote_char(s, byte(quote))
+		if !ok {
+			delete(buf)
+			return s, false, false
+		}
+		s = tail_string
+		if r < 0x80 || !multiple_bytes {
+			buf[offset] = byte(r)
+			offset += 1
+		} else {
+			b, w := utf8.encode_rune(r)
+			copy(buf[offset:], b[:w])
+			offset += w
+		}
+	}
+
+	new_string := string(buf[:offset])
+
+	return new_string, true, true
+}

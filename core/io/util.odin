@@ -1,0 +1,603 @@
+package io
+
+import "core:strconv"
+import "core:unicode"
+import "core:unicode/utf8"
+import "core:unicode/utf16"
+
+read_ptr :: proc(r: Reader, p: rawptr, byte_size: int, n_read: ^int = nil) -> (n: int, err: Error) {
+	return read(r, ([^]byte)(p)[:byte_size], n_read)
+}
+
+read_slice :: proc(r: Reader, slice: $S/[]$T, n_read: ^int = nil) -> (n: int, err: Error) {
+	size := len(slice)*size_of(T)
+	return read_ptr(r, raw_data(slice), size, n_read)
+}
+
+write_ptr :: proc(w: Writer, p: rawptr, byte_size: int, n_written: ^int = nil) -> (n: int, err: Error) {
+	return write(w, ([^]byte)(p)[:byte_size], n_written)
+}
+
+read_ptr_at :: proc(r: Reader_At, p: rawptr, byte_size: int, offset: i64, n_read: ^int = nil) -> (n: int, err: Error) {
+	return read_at(r, ([^]byte)(p)[:byte_size], offset, n_read)
+}
+
+write_ptr_at :: proc(w: Writer_At, p: rawptr, byte_size: int, offset: i64, n_written: ^int = nil) -> (n: int, err: Error) {
+	return write_at(w, ([^]byte)(p)[:byte_size], offset, n_written)
+}
+
+write_slice :: proc(w: Writer, slice: $S/[]$T, n_written: ^int = nil) -> (n: int, err: Error) {
+	size := len(slice)*size_of(T)
+	return write_ptr(w, raw_data(slice), size, n_written)
+}
+
+
+write_u64 :: proc(w: Writer, i: u64, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [64]byte
+	s := strconv.write_bits(buf[:], i, base, false, 64, strconv.digits, nil)
+	return write_string(w, s, n_written)
+}
+write_i64 :: proc(w: Writer, i: i64, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [65]byte
+	s := strconv.write_bits(buf[:], u64(i), base, true, 64, strconv.digits, nil)
+	return write_string(w, s, n_written)
+}
+
+write_uint :: proc(w: Writer, i: uint, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	return write_u64(w, u64(i), base, n_written)
+}
+write_int :: proc(w: Writer, i: int, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	return write_i64(w, i64(i), base, n_written)
+}
+
+write_u128 :: proc(w: Writer, i: u128, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [128]byte
+	s := strconv.write_bits_128(buf[:], i, base, false, 128, strconv.digits, nil)
+	return write_string(w, s, n_written)
+}
+write_i128 :: proc(w: Writer, i: i128, base: int = 10, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [129]byte
+	s := strconv.write_bits_128(buf[:], u128(i), base, true, 128, strconv.digits, nil)
+	return write_string(w, s, n_written)
+}
+write_f16 :: proc(w: Writer, val: f16, n_written: ^int = nil) -> (n: int, err: Error) {
+	// COMPAT: Previously, this used to strip the '+' sign from "+Inf",
+	//         unlike all other float formatting functions in core.
+	//         It will now preserve it for "+Inf".
+	buf: [386]byte
+	str := strconv.write_float(buf[:], f64(val), 'f', 2*size_of(val), 8*size_of(val), nil)
+	return write_string(w, str, n_written)
+}
+write_f32 :: proc(w: Writer, val: f32, n_written: ^int = nil) -> (n: int, err: Error) {
+	// COMPAT: Previously, this used to strip the '+' sign from "+Inf",
+	//         unlike all other float formatting functions in core.
+	//         It will now preserve it for "+Inf".
+	buf: [386]byte
+	str := strconv.write_float(buf[:], f64(val), 'f', 2*size_of(val), 8*size_of(val), nil)
+	return write_string(w, str, n_written)
+}
+write_f64 :: proc(w: Writer, val: f64, n_written: ^int = nil) -> (n: int, err: Error) {
+	// COMPAT: Previously, this used to strip the '+' sign from "+Inf",
+	//         unlike all other float formatting functions in core.
+	//         It will now preserve it for "+Inf".
+	buf: [386]byte
+	str := strconv.write_float(buf[:], val, 'f', 2*size_of(val), 8*size_of(val), nil)
+	return write_string(w, str, n_written)
+}
+
+
+
+
+/*
+Writes rune `r` to the Writer `w` as UTF-8, optionally enclosed in single quotes.
+
+**Inputs:**
+- `w`:            The Writer to write to.
+- `r`:            The rune to write.
+- `write_quote`:  If true (the default), writes the rune as a quoted rune literal; otherwise writes it unquoted.
+- `n_written`:    Optional pointer to a counter to which the number of bytes written is added.
+
+**Returns:**
+- `n`:            The number of bytes written.
+- `err`:          An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+When `write_quote` is `true`, the output is escaped and quoted as a rune literal.
+
+When `write_quote` is `false`, the rune is written unquoted and neither single nor double quotes are escaped.
+
+If the Writer writes only part of the output before returning an error, `n` reports the number of bytes written.
+*/
+write_encoded_rune :: proc(w: Writer, r: rune, write_quote := true, n_written: ^int = nil) -> (n: int, err: Error) {
+	if write_quote {
+		return write_quoted_rune(w, r, n_written = n_written)
+	} else {
+		// COMPAT: Originally, this procedure would never escape the quote character.
+		//         It does now when `write_quote` is true (that was arguably a bug),
+		//         but for compatibility, we still don't escape the quote in this branch.
+		return write_encoded_and_escaped_rune(w, r, 0, n_written = n_written)
+	}
+}
+
+/*
+Writes rune `r` to the Writer `w` as UTF-8, escaping it as needed and escaping `quote` when it occurs.
+
+**Inputs:**
+- `w`:          The Writer to write to.
+- `r`:          The rune to write.
+- `quote`:      An enclosing quote character to escape; pass `0` to disable quote-character escaping.
+- `html_safe`:  If `true`, also escapes `<`, `>` and `&` using hexadecimal escapes (`\x##`).
+- `n_written`:  Optional pointer to a counter to which the number of bytes written is added.
+
+**Returns:**
+- `n`:          The number of bytes written.
+- `err`:        An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+The rune is not surrounded by quotes. For quoted output, use `write_quoted_rune` or `write_quoted_string`.
+
+If the Writer writes only part of the output before returning an error, `n` reports the number of bytes written.
+*/
+write_escaped_rune :: proc(w: Writer, r: rune, quote: byte, html_safe := false, n_written: ^int = nil) -> (n: int, err: Error) {
+	options: strconv.Rune_Escaping_Options
+	if html_safe {
+		options |= { .html_safe }
+	}
+	return write_encoded_and_escaped_rune(w, r, quote, options, n_written)
+}
+
+/*
+Writes rune `r` to the Writer `w` as UTF-8, escaping it as needed and escaping `quote` when it occurs.
+
+**Inputs:**
+- `w`:          The Writer to write to.
+- `r`:          The rune to write.
+- `quote`:      An enclosing quote character to escape; pass `0` to disable quote-character escaping.
+- `options`:    Controls how the rune is escaped.
+- `n_written`:  Optional pointer to a counter to which the number of bytes written is added.
+
+**Returns:**
+- `n`:          The number of bytes written.
+- `err`:        An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+The rune is not surrounded by quotes. Use `write_quoted_rune` or `write_quoted_string` to produce quoted output.
+
+If the Writer writes only part of the output before returning an error, `n` reports the number of bytes written.
+*/
+write_encoded_and_escaped_rune :: proc(w: Writer, r: rune, quote: byte, options: strconv.Rune_Escaping_Options = nil, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [strconv.ESCAPED_RUNE_MAX_NEEDED_BYTES]byte
+	str, encode_and_escape_rune_ok := strconv.encode_and_escape_rune(buf[:], r, quote, options)
+	assert(encode_and_escape_rune_ok == true)
+	return write_string(w, str, n_written)
+}
+
+/*
+Writes `str` to the Writer `w`, enclosed in `quote` characters, escaping runes as needed.
+
+**Inputs:**
+- `w`:          The Writer to write to.
+- `str`:        The string to quote and write.
+- `quote`:      The enclosing quote character (double quote by default).
+- `n_written`:  Optional pointer to a counter to which the number of bytes written is added.
+- `options`:    Controls how runes in the string are escaped.
+
+**Returns:**
+- `n`:          The number of bytes written.
+- `err`:        An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+With the default double quote and escaping options, the output is quoted and escaped as an Odin string literal.
+
+Invalid UTF-8 bytes in `str` are written as hexadecimal byte escapes. If the Writer writes only part of the
+output before returning an error, `n` reports the number of bytes written.
+*/
+write_quoted_string :: proc(w: Writer, str: string, quote: byte = '"', n_written: ^int = nil, options: strconv.Rune_Escaping_Options = nil) -> (n: int, err: Error) {
+	@(require_results)
+	quotes_as_itself :: proc(r: rune, width: int, quote: byte, options: strconv.Rune_Escaping_Options) -> bool {
+		switch {
+		case width == 1 && r == utf8.RUNE_ERROR:
+			return false
+		case r == '\\' || (quote != 0 && r == rune(quote)):
+			return false
+		case .html_safe in options && (r == '<' || r == '>' || r == '&'):
+			return false
+		}
+		return unicode.is_printable(r) && (r < utf8.RUNE_SELF || .ascii_compatible not_in options)
+	}
+
+	defer if n_written != nil {
+		n_written^ += n
+	}
+
+	write_byte(w, quote, &n) or_return
+
+	// NOTE(bill): A run of runes that encode as themselves is written in one go
+	run := 0
+	for i := 0; i < len(str); /**/ {
+		r, width := rune(str[i]), 1
+		if r >= utf8.RUNE_SELF {
+			r, width = utf8.decode_rune_in_string(str[i:])
+		}
+		if quotes_as_itself(r, width, quote, options) {
+			i += width
+			continue
+		}
+
+		if run < i {
+			write_string(w, str[run:i], &n) or_return
+		}
+		if width == 1 && r == utf8.RUNE_ERROR {
+			// Encode the byte exactly as it was found in the input string: `\x##`
+			write_string(w, `\x`, &n)                       or_return
+			write_byte(w, strconv.digits[str[i] >> 4], &n)  or_return
+			write_byte(w, strconv.digits[str[i] & 0xf], &n) or_return
+		} else {
+			encoded_rune_buf: [strconv.ESCAPED_RUNE_MAX_NEEDED_BYTES]byte
+			encoded_rune, encode_rune_ok := strconv.encode_and_escape_rune(encoded_rune_buf[:], r, quote, options = options)
+			assert(encode_rune_ok == true)
+			write_string(w, encoded_rune, &n) or_return
+		}
+		i  += width
+		run = i
+	}
+	if run < len(str) {
+		write_string(w, str[run:], &n) or_return
+	}
+
+	write_byte(w, quote, &n) or_return
+
+	return
+}
+
+
+/*
+Writes `str` to the Writer `w`, enclosed in `quote` characters, escaping runes as needed.
+
+**NOTE:** The UTF-16 input string is encoded as UTF-8 in the output.
+
+**Inputs:**
+- `w`:          The Writer to write to.
+- `str`:        The UTF-16 string to quote and write.
+- `quote`:      The enclosing quote character (double quote by default).
+- `n_written`:  Optional pointer to a counter to which the number of bytes written is added.
+- `options`:    Controls how runes in the string are escaped.
+
+**Returns:**
+- `n`:          The number of UTF-8 bytes written.
+- `err`:        An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+With the default double quote and escaping options, the output is quoted and escaped as an Odin string literal.
+
+Unpaired UTF-16 surrogates are encoded as the Unicode replacement character. The UTF-16 decoder does not
+distinguish malformed sequences from literal replacement characters, so both are written identically.
+
+If the Writer writes only part of the output before returning an error, `n` reports the number of bytes written.
+*/
+write_quoted_string16 :: proc(w: Writer, str: string16, quote: byte = '"', n_written: ^int = nil, options: strconv.Rune_Escaping_Options = nil) -> (n: int, err: Error) {
+	defer if n_written != nil {
+		n_written^ += n
+	}
+
+	write_byte(w, quote, &n) or_return
+
+	s := str
+
+	for len(s) > 0 {
+		r, width := utf16.decode_rune_in_string(s)
+		assert(width > 0)
+		encoded_rune_buf: [strconv.ESCAPED_RUNE_MAX_NEEDED_BYTES]byte
+		encoded_rune, encode_rune_ok := strconv.encode_and_escape_rune(encoded_rune_buf[:], r, quote, options = options)
+		assert(encode_rune_ok == true)
+		write_string(w, encoded_rune, &n) or_return
+		// Advance input cursor to the next codepoint.
+		s = s[width:]
+	}
+
+	write_byte(w, quote, &n) or_return
+
+	return
+}
+
+/*
+Writes rune `r` to the Writer `w` as a quoted rune literal, escaping it as needed.
+
+**Inputs:**
+- `w`:          The Writer to write to.
+- `r`:          The rune to quote and write.
+- `options`:    Controls how the rune is escaped.
+- `n_written`:  Optional pointer to a counter to which the number of bytes written is added.
+
+**Returns:**
+- `n`:          The number of bytes written.
+- `err`:        An error encountered while writing, or `nil` on success.
+
+**Remarks:**
+
+The result is enclosed in single quotes. If the Writer writes only part of the output before returning an
+error, `n` reports the number of bytes written.
+*/
+write_quoted_rune :: proc(w: Writer, r: rune, options: strconv.Rune_Escaping_Options = nil, n_written: ^int = nil) -> (n: int, err: Error) {
+	buf: [strconv.QUOTED_RUNE_MAX_NEEDED_BYTES]byte
+	str, quote_rune_ok := strconv.quote_rune(buf[:], r, options)
+	assert(quote_rune_ok == true)
+	return write_string(w, str, n_written)
+}
+
+
+
+
+Tee_Reader :: struct {
+	r: Reader,
+	w: Writer,
+}
+
+@(private)
+_tee_reader_proc :: proc(stream_data: rawptr, mode: Stream_Mode, p: []byte, offset: i64, whence: Seek_From) -> (n: i64, err: Error) {
+	t := (^Tee_Reader)(stream_data)
+	#partial switch mode {
+	case .Read:
+		n, err = _i64_err(read(t.r, p))
+		if n > 0 {
+			if wn, werr := write(t.w, p[:n]); werr != nil {
+				return i64(wn), werr
+			}
+		}
+		return
+	case .Query:
+		return query_utility({.Read, .Query})
+	}
+	return 0, .Unsupported
+}
+
+// tee_reader_init returns a Reader that writes to 'w' what it reads from 'r'
+// All reads from 'r' performed through it are matched with a corresponding write to 'w'
+// There is no internal buffering done
+// The write must complete before th read completes
+// Any error encountered whilst writing is reported as a 'read' error
+// tee_reader_init must call io.destroy when done with
+tee_reader_init :: proc(t: ^Tee_Reader, r: Reader, w: Writer, allocator := context.allocator) -> Reader {
+	t.r, t.w = r, w
+	return tee_reader_to_reader(t)
+}
+
+tee_reader_to_reader :: proc(t: ^Tee_Reader) -> (r: Reader) {
+	r.data = t
+	r.procedure = _tee_reader_proc
+	return
+}
+
+
+// A Limited_Reader reads from r but limits the amount of data returned to just n bytes.
+// Each call to read updates n to reflect the new amount remaining.
+// read returns EOF when n <= 0 or when the underlying r returns EOF.
+Limited_Reader :: struct {
+	r: Reader, // underlying reader
+	n: i64,    // max_bytes
+}
+
+@(private)
+_limited_reader_proc :: proc(stream_data: rawptr, mode: Stream_Mode, p: []byte, offset: i64, whence: Seek_From) -> (n: i64, err: Error) {
+	l := (^Limited_Reader)(stream_data)
+	#partial switch mode {
+	case .Read:
+		if len(p) == 0 {
+			return 0, nil
+		}
+		if l.n <= 0 {
+			return 0, .EOF
+		}
+		p := p
+		if i64(len(p)) > l.n {
+			p = p[0:l.n]
+		}
+		n, err = _i64_err(read(l.r, p))
+		l.n -= i64(n)
+		return
+	case .Query:
+		return query_utility({.Read, .Query})
+	}
+	return 0, .Unsupported
+}
+
+limited_reader_init :: proc(l: ^Limited_Reader, r: Reader, n: i64) -> Reader {
+	l.r = r
+	l.n = n
+	return limited_reader_to_reader(l)
+}
+
+limited_reader_to_reader :: proc(l: ^Limited_Reader) -> (r: Reader) {
+	r.procedure = _limited_reader_proc
+	r.data = l
+	return
+}
+
+// Section_Reader implements read, seek, and read_at on a section of an underlying Reader_At
+Section_Reader :: struct {
+	r: Reader_At,
+	base:  i64,
+	off:   i64,
+	limit: i64,
+}
+
+section_reader_init :: proc(s: ^Section_Reader, r: Reader_At, off: i64, n: i64) -> Reader {
+	s.r = r
+	s.base = off
+	s.off = off
+	s.limit = off + n
+	return section_reader_to_stream(s)
+}
+section_reader_to_stream :: proc(s: ^Section_Reader) -> (out: Stream) {
+	out.data = s
+	out.procedure = _section_reader_proc
+	return
+}
+
+@(private)
+_section_reader_proc :: proc(stream_data: rawptr, mode: Stream_Mode, p: []byte, offset: i64, whence: Seek_From) -> (n: i64, err: Error) {
+	s := (^Section_Reader)(stream_data)
+	#partial switch mode {
+	case .Read:
+		if len(p) == 0 {
+			return 0, nil
+		}
+		if s.off >= s.limit {
+			return 0, .EOF
+		}
+		p := p
+		if max := s.limit - s.off; i64(len(p)) > max {
+			p = p[0:max]
+		}
+		n, err = _i64_err(read_at(s.r, p, s.off))
+		s.off += i64(n)
+		return
+	case .Read_At:
+		if len(p) == 0 {
+			return 0, nil
+		}
+		p, off := p, offset
+
+		if off < 0 || off >= s.limit - s.base {
+			return 0, .EOF
+		}
+		off += s.base
+		if max := s.limit - off; i64(len(p)) > max {
+			p = p[0:max]
+			n, err = _i64_err(read_at(s.r, p, off))
+			if err == nil {
+				err = .EOF
+			}
+			return
+		}
+		return _i64_err(read_at(s.r, p, off))
+
+	case .Seek:
+		offset := offset
+		switch whence {
+		case:
+			return 0, .Invalid_Whence
+		case .Start:
+			offset += s.base
+		case .Current:
+			offset += s.off
+		case .End:
+			offset += s.limit
+		}
+		if offset < s.base {
+			return 0, .Invalid_Offset
+		}
+		s.off = offset
+		n = offset - s.base
+		return
+	case .Size:
+		n = s.limit - s.base
+		return
+	case .Query:
+		return query_utility({.Read, .Read_At, .Seek, .Size, .Query})
+	}
+	return 0, nil
+
+}
+
+
+// Counting_Stream passes everything on to an underlying stream, counting the bytes read and written and how
+// often each mode is used.
+//
+// With a nil underlying stream it takes every write and discards it, which measures output without keeping it.
+// It then seeks as a file would, keeping `pos` and `size`, so `size` is how large a file the writes would have made
+// even when they seek back or write at an offset; reads always give .EOF, as nothing written is kept;
+// and flushing, closing and destroying do nothing.
+Counting_Stream :: struct {
+	s:             Stream,           // underlying stream, or nil to discard writes
+	bytes_read:    i64,              // by .Read and .Read_At, as the underlying stream reports them
+	bytes_written: i64,              // by .Write and .Write_At, as the underlying stream reports them
+	calls:         [Stream_Mode]i64, // how many times each mode was used
+
+	// Only with a nil underlying stream
+	pos:  i64, // where the next .Write lands
+	size: i64, // the end of the furthest write
+}
+
+@(private)
+_counting_stream_proc :: proc(stream_data: rawptr, mode: Stream_Mode, p: []byte, offset: i64, whence: Seek_From) -> (n: i64, err: Error) {
+	c := (^Counting_Stream)(stream_data)
+	c.calls[mode] += 1
+
+	if c.s.procedure == nil {
+		switch mode {
+		case .Write:
+			c.bytes_written += i64(len(p))
+			c.pos           += i64(len(p))
+			c.size           = max(c.size, c.pos)
+			return i64(len(p)), nil
+
+		case .Write_At:
+			if offset < 0 {
+				return 0, .Invalid_Offset
+			}
+			c.bytes_written += i64(len(p))
+			c.size           = max(c.size, offset + i64(len(p)))
+			return i64(len(p)), nil
+
+		case .Read, .Read_At:
+			return 0, .EOF
+
+		case .Seek:
+			pos: i64
+			switch whence {
+			case .Start:   pos = offset
+			case .Current: pos = c.pos + offset
+			case .End:     pos = c.size + offset
+			case:          return 0, .Invalid_Whence
+			}
+			if pos < 0 {
+				return 0, .Invalid_Offset
+			}
+			c.pos = pos
+			return pos, nil
+
+		case .Size:
+			return c.size, nil
+
+		case .Flush, .Close, .Destroy:
+			return 0, nil
+
+		case .Query:
+			return query_utility({.Write, .Write_At, .Read, .Read_At, .Seek, .Size, .Flush, .Close, .Destroy, .Query})
+		}
+		return 0, .Unsupported
+	}
+
+	if mode == .Query {
+		return query_utility(query(c.s) + {.Query})
+	}
+
+	// Bytes are counted as the underlying stream reports them, errors included, so a short write counts what went through
+	n, err = c.s.procedure(c.s.data, mode, p, offset, whence)
+	#partial switch mode {
+	case .Read, .Read_At:
+		c.bytes_read += n
+	case .Write, .Write_At:
+		c.bytes_written += n
+	}
+	return
+}
+
+// counting_stream_init returns a Stream that counts what passes through it to 's', with its counts reset.
+// A nil 's' discards every write, keeping only where it would have landed.
+counting_stream_init :: proc(c: ^Counting_Stream, s: Stream) -> Stream {
+	c^ = {s = s}
+	return counting_stream_to_stream(c)
+}
+
+counting_stream_to_stream :: proc(c: ^Counting_Stream) -> (s: Stream) {
+	s.data = c
+	s.procedure = _counting_stream_proc
+	return
+}

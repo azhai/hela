@@ -1,0 +1,278 @@
+package test_core_unicode
+
+import "core:log"
+import "core:testing"
+import "core:unicode"
+import "core:unicode/utf8"
+
+Test_Case :: struct {
+	str: string,
+	expected_clusters: int,
+}
+
+Text_Test_Case :: struct {
+	str: string,
+	expected_output: []string,
+}
+
+run_test_cases :: proc(t: ^testing.T, test_cases: []Test_Case, loc := #caller_location) {
+	failed := 0
+	for c, i in test_cases {
+		log.debugf("(#% 4i) %q ...", i, c.str)
+		result, _, _ := utf8.grapheme_count(c.str)
+		if !testing.expectf(t, result == c.expected_clusters,
+			"(#% 4i) graphemes: %i != %i, %q %s", i, result, c.expected_clusters, c.str, c.str,
+			loc = loc) {
+			failed += 1
+		}
+	}
+
+	log.logf(.Error if failed > 0 else .Info, "% 4i/% 4i test cases failed.", failed, len(test_cases), location = loc)
+}
+
+@test
+test_official_gcb_cases :: proc(t: ^testing.T) {
+	run_test_cases(t, official_grapheme_break_test_cases)
+}
+
+@test
+test_official_emoji_cases :: proc(t: ^testing.T) {
+	run_test_cases(t, official_emoji_test_cases)
+}
+
+@test
+test_grapheme_byte_index_segmentation :: proc(t: ^testing.T) {
+	SAMPLE_1 :: "\U0001F600"
+	SAMPLE_2 :: "\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F"
+	SAMPLE_3 :: "\U0001F468\U0001F3FB\u200D\U0001F9B0"
+
+	str := SAMPLE_1 + SAMPLE_2 + SAMPLE_3 + SAMPLE_2 + SAMPLE_1
+
+	graphemes, _, _, _ := utf8.decode_grapheme_clusters(str)
+	defer delete(graphemes)
+
+	defer if testing.failed(t) {
+		log.infof("%#v\n%q\n%v", graphemes, str, transmute([]u8)str)
+	}
+	if !testing.expect_value(t, len(graphemes), 5) {
+		return
+	}
+
+	testing.expect_value(t, graphemes[0].rune_index, 0)
+	testing.expect_value(t, graphemes[1].rune_index, 1)
+	testing.expect_value(t, graphemes[2].rune_index, 8)
+	testing.expect_value(t, graphemes[3].rune_index, 12)
+	testing.expect_value(t, graphemes[4].rune_index, 19)
+
+	grapheme_1 := str[graphemes[0].byte_index:graphemes[1].byte_index]
+	grapheme_2 := str[graphemes[1].byte_index:graphemes[2].byte_index]
+	grapheme_3 := str[graphemes[2].byte_index:graphemes[3].byte_index]
+	grapheme_4 := str[graphemes[3].byte_index:graphemes[4].byte_index]
+	grapheme_5 := str[graphemes[4].byte_index:]
+
+	testing.expectf(t, grapheme_1 == SAMPLE_1, "expected %q, got %q", SAMPLE_1, grapheme_1)
+	testing.expectf(t, grapheme_2 == SAMPLE_2, "expected %q, got %q", SAMPLE_2, grapheme_2)
+	testing.expectf(t, grapheme_3 == SAMPLE_3, "expected %q, got %q", SAMPLE_3, grapheme_3)
+	testing.expectf(t, grapheme_4 == SAMPLE_2, "expected %q, got %q", SAMPLE_2, grapheme_2)
+	testing.expectf(t, grapheme_5 == SAMPLE_1, "expected %q, got %q", SAMPLE_1, grapheme_1)
+}
+
+@test
+test_width :: proc(t: ^testing.T) {
+	{
+		str := "He\u200dllo"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 5)
+		testing.expect_value(t, width, 5)
+	}
+
+	{
+		// Note that a zero-width space is still considered a grapheme as far
+		// as the specification is concerned.
+		str := "He\u200bllo"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 6)
+		testing.expect_value(t, width, 5)
+	}
+
+	{
+		str := "\U0001F926\U0001F3FC\u200D\u2642"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 1)
+		testing.expect_value(t, width, 2)
+	}
+
+	{
+		str := "H̷e̶l̵l̸o̴p̵e̷ ̸w̶o̸r̵l̶d̵!̴"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 14)
+		testing.expect_value(t, width, 14)
+	}
+
+	{
+		str := "aカ.ヒフ"
+		graphemes, grapheme_count, _, width := utf8.decode_grapheme_clusters(str)
+		defer delete(graphemes)
+		testing.expect_value(t, grapheme_count, 5)
+		testing.expect_value(t, width, 8)
+		if grapheme_count == 5 {
+			testing.expect_value(t, graphemes[0].width, 1)
+			testing.expect_value(t, graphemes[1].width, 2)
+			testing.expect_value(t, graphemes[2].width, 1)
+			testing.expect_value(t, graphemes[3].width, 2)
+			testing.expect_value(t, graphemes[4].width, 2)
+		}
+	}
+
+	{
+		str := "いろはにほへ"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 6)
+		testing.expect_value(t, width, 12)
+	}
+
+	{
+		str := "舍利弗，是諸法空相，不生不滅，不垢不淨，不增不減。"
+		graphemes, _, width := utf8.grapheme_count(str)
+		testing.expect_value(t, graphemes, 25)
+		testing.expect_value(t, width, 50)
+	}
+}
+
+@test
+test_grapheme_width_continuation_runes :: proc(t: ^testing.T) {
+	Grapheme_Width_Test_Case :: struct {
+		str:                     string,
+		expected_grapheme_count: int,
+		expected_total_width:    int,
+		expected_widths:         []int,
+	}
+
+	cases :: []Grapheme_Width_Test_Case{
+		{"\U0001F3F3\uFE0F\u200D\U0001F308", 1, 2, {2}},
+		{"\U0001F1FA\U0001F1F8", 1, 2, {2}},
+		{"\U0001F1FA", 1, 1, {1}},
+		{"\U0001F1FA\U0001F1F8\U0001F1EE\U0001F1EA", 2, 4, {2, 2}},
+		{"\U0001F1FA\U0001F1F8\U0001F1EC", 2, 3, {2, 1}},
+	}
+
+	for c in cases {
+		// Test utf8.grapheme_width
+		graphemes, _, width := utf8.grapheme_count(c.str)
+		testing.expectf(t, graphemes == c.expected_grapheme_count, "%q: expected %d graphemes, got %d", c.str, c.expected_grapheme_count, graphemes)
+		testing.expectf(t, width == c.expected_total_width, "%q: expected total width %d, got %d", c.str, c.expected_total_width, width)
+
+		// Test utf8.decode_grapheme_clusters
+		clusters, cluster_count, _, total_width := utf8.decode_grapheme_clusters(c.str)
+		defer delete(clusters)
+
+		testing.expectf(t, cluster_count == c.expected_grapheme_count, "%q: expected %d clusters, got %d", c.str, c.expected_grapheme_count, cluster_count)
+		testing.expectf(t, total_width == c.expected_total_width, "%q: expected total width %d, got %d", c.str, c.expected_total_width, total_width)
+
+		if testing.expectf(t, len(clusters) == len(c.expected_widths), "%q: expected %d cluster widths, got %d", c.str, len(c.expected_widths), len(clusters)) {
+			for expected_w, i in c.expected_widths {
+				testing.expectf(t, clusters[i].width == expected_w, "%q cluster %d: expected width %d, got %d", c.str, i, expected_w, clusters[i].width)
+			}
+		}
+	}
+}
+
+@test
+test_grapheme_cluster_text :: proc(t: ^testing.T) {
+
+	cases :: []Text_Test_Case {
+		{"abc", {"a", "b", "c"}},
+		{"é", {"é"}},
+		{"中", {"中"}},
+		{"\U0001F1FA\U0001F1F8", {"\U0001F1FA\U0001F1F8"}},
+		{"\U0001F1FA\U0001F1F8\U0001F1EE\U0001F1EA", {"\U0001F1FA\U0001F1F8", "\U0001F1EE\U0001F1EA"}},
+		{"\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466", {"\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466"}},
+		{"\U0001F44D\U0001F3FD", {"\U0001F44D\U0001F3FD"}},
+		{"a\r\nb", {"a", "\r\n", "b"}},
+	}
+
+	for c in cases {
+		it := utf8.decode_grapheme_iterator_make(c.str)
+		i := 0
+		for text, grapheme in utf8.decode_grapheme_iterate(&it) {
+			if !testing.expectf(t, i < len(c.expected_output), "%q: expected %d clusters, got at least %d", c.str, len(c.expected_output), i + 1) {
+				break
+			}
+			testing.expectf(t, text == c.expected_output[i], "%q cluster %d: expected text %q, got %q", c.str, i, c.expected_output[i], text)
+			testing.expectf(t, text == c.str[grapheme.byte_index:][:len(text)], "%q cluster %d: text does not start at byte_index %d", c.str, i, grapheme.byte_index)
+			i += 1
+		}
+		testing.expectf(t, i == len(c.expected_output), "%q: expected %d clusters, got %d", c.str, len(c.expected_output), i)
+	}
+}
+
+@test
+test_case_mapping :: proc(t: ^testing.T) {
+	Case_Test_Case :: struct {
+		r:     rune,
+		upper: rune,
+		lower: rune,
+		title: rune,
+	}
+
+	cases :: []Case_Test_Case {
+		{'a',          'A',          'a',          'A'},
+		{'A',          'A',          'a',          'A'},
+		{'1',          '1',          '1',          '1'},
+		{'ß',          'ß',          'ß',          'ß'},
+		{'ẞ',          'ẞ',          'ß',          'ẞ'},
+		{'ÿ',          'Ÿ',          'ÿ',          'Ÿ'},
+		{'ā',          'Ā',          'ā',          'Ā'},
+		{'ą',          'Ą',          'ą',          'Ą'},
+		{'ĉ',          'Ĉ',          'ĉ',          'Ĉ'},
+		{'ƀ',          'Ƀ',          'ƀ',          'Ƀ'},
+		{'Ǝ',          'Ǝ',          'ǝ',          'Ǝ'},
+		{'ɘ',          'ɘ',          'ɘ',          'ɘ'},
+		{'Ǆ',          'Ǆ',          'ǆ',          'ǅ'},
+		{'ǅ',          'Ǆ',          'ǆ',          'ǅ'},
+		{'ǆ',          'Ǆ',          'ǆ',          'ǅ'},
+		{'Ǉ',          'Ǉ',          'ǉ',          'ǈ'},
+		{'ǳ',          'Ǳ',          'ǳ',          'ǲ'},
+		{'ș',          'Ș',          'ș',          'Ș'},
+		{'Ț',          'Ț',          'ț',          'Ț'},
+		{'µ',          'Μ',          'µ',          'Μ'},
+		{'ς',          'Σ',          'ς',          'Σ'},
+		{'Ѐ',          'Ѐ',          'ѐ',          'Ѐ'},
+		{'Ӏ',          'Ӏ',          'ӏ',          'Ӏ'},
+		{'Ԁ',          'Ԁ',          'ԁ',          'Ԁ'},
+		{'Ⴀ',          'Ⴀ',          'ⴀ',          'Ⴀ'},
+		{'ა',          'Ა',          'ა',          'ა'},
+		{'Ა',          'Ა',          'ა',          'Ა'},
+		{'\u2126',     '\u2126',     'ω',          '\u2126'},
+		{'\u212A',     '\u212A',     'k',          '\u212A'},
+		{'Ⰰ',          'Ⰰ',          'ⰰ',          'Ⰰ'},
+		{'Ⲁ',          'Ⲁ',          'ⲁ',          'Ⲁ'},
+		{'Ꜣ',          'Ꜣ',          'ꜣ',          'Ꜣ'},
+		{'ꭰ',          'Ꭰ',          'ꭰ',          'Ꭰ'},
+		{'𐐀',          '𐐀',          '𐐨',          '𐐀'},
+		{'𐓘',          '𐒰',          '𐓘',          '𐒰'},
+		{'𐲀',          '𐲀',          '𐳀',          '𐲀'},
+		{'\U00010D50', '\U00010D50', '\U00010D70', '\U00010D50'},
+		{'𞤀',          '𞤀',          '𞤢',          '𞤀'},
+	}
+
+	for c in cases {
+		testing.expectf(t, unicode.to_upper(c.r) == c.upper, "to_upper(%U): expected %U, got %U", c.r, c.upper, unicode.to_upper(c.r))
+		testing.expectf(t, unicode.to_lower(c.r) == c.lower, "to_lower(%U): expected %U, got %U", c.r, c.lower, unicode.to_lower(c.r))
+		testing.expectf(t, unicode.to_title(c.r) == c.title, "to_title(%U): expected %U, got %U", c.r, c.title, unicode.to_title(c.r))
+	}
+}
+
+@(test)
+test_utf8_encode_invalid_runes_as_replacement :: proc(t: ^testing.T) {
+	runes := [?]rune { 0xd800, 0x110000, -1 }
+	for r in runes {
+		encoded, width := utf8.encode_rune(r)
+		testing.expect_value(t, width, 3)
+		testing.expect(t, encoded[0] == 0xef && encoded[1] == 0xbf && encoded[2] == 0xbd, "invalid runes must encode as the UTF-8 replacement character")
+		// It must decode back as the replacement character.
+		decoded, decoded_width := utf8.decode_rune_in_bytes(encoded[:width])
+		testing.expect_value(t, decoded, utf8.REPLACEMENT_CHAR)
+		testing.expect_value(t, decoded_width, 3)
+	}
+}

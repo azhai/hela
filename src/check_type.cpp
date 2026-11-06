@@ -1,0 +1,5604 @@
+gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location);
+gb_internal Type *determine_type_from_polymorphic(CheckerContext *ctx, Type *poly_type, Operand const &operand);
+gb_internal bool subst_check_specialization(CheckerContext *ctx, Type *specialization, Type *type, bool modify_type);
+gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is_variadic_, isize *variadic_index_, bool *success_, isize *specialization_count_, Array<Operand> const *operands);
+gb_internal void populate_using_entity_scope(CheckerContext *ctx, Ast *node, AstField *field, Type *t, isize level);
+
+gb_internal void populate_using_array_index(CheckerContext *ctx, Ast *node, AstField *field, Type *t, String name, i32 idx) {
+	t = base_type(t);
+	GB_ASSERT(t->kind == Type_Array);
+	InternedString interned = string_interner_insert(name);
+
+	Entity *e = scope_lookup_current(ctx->scope, interned);
+	if (e != nullptr) {
+		gbString str = nullptr;
+		defer (gb_string_free(str));
+		if (node != nullptr) {
+			str = expr_to_string(node);
+		}
+		if (str != nullptr) {
+			error(e->token, "'%.*s' is already declared in '%s'", LIT(name), str);
+		} else {
+			error(e->token, "'%.*s' is already declared", LIT(name));
+		}
+	} else {
+		Token tok = make_token_ident(name);
+		if (field) {
+			if (field->names.count > 0) {
+				tok.pos = ast_token(field->names[0]).pos;
+			} else {
+				tok.pos = ast_token(field->type).pos;
+			}
+		}
+		Entity *f = alloc_entity_array_elem(nullptr, tok, t->Array.elem, idx);
+		add_entity(ctx, ctx->scope, nullptr, f);
+	}
+}
+
+gb_internal void populate_using_entity_scope_field(CheckerContext *ctx, Ast *node, AstField *parent_field, Type *original_type, isize level, Entity* field_entity) {
+	GB_ASSERT(field_entity->kind == Entity_Variable);
+	String name = field_entity->token.string;
+	InternedString interned = entity_interned_name(field_entity);
+	Entity *e = scope_lookup_current(ctx->scope, interned);
+	if (e != nullptr && name != "_") {
+		gbString ot = type_to_string(original_type);
+		// TODO(bill): Better type error
+		if (node != nullptr) {
+			gbString str = expr_to_string(node);
+			error(e->token, "'%.*s' is already declared in '%s', through 'using' from '%s'", LIT(name), str, ot);
+			gb_string_free(str);
+		} else {
+			error(e->token, "'%.*s' is already declared, through 'using' from '%s'", LIT(name), ot);
+		}
+		gb_string_free(ot);
+	} else {
+		add_entity(ctx, ctx->scope, nullptr, field_entity);
+		if (field_entity->flags & EntityFlag_Using) {
+			populate_using_entity_scope(ctx, node, parent_field, field_entity->type, level+1);
+		}
+	}
+}
+
+gb_internal void populate_using_entity_scope(CheckerContext *ctx, Ast *node, AstField *field, Type *t, isize level) {
+	if (t == nullptr) {
+		return;
+	}
+	Type *original_type = t;
+	t = base_type(type_deref(t));
+	// Promote through a constrained generic (`$P/Spec`) using its specialization's member layout.
+	if (t->kind == Type_Generic && t->Generic.specialized != nullptr) {
+		t = base_type(t->Generic.specialized);
+	}
+
+	if (t->kind == Type_Struct) {
+		for (Entity *f : t->Struct.fields) {
+			populate_using_entity_scope_field(ctx, node, field, original_type, level, f);
+		}
+	} else if (t->kind == Type_BitField) {
+		for (Entity *f : t->BitField.fields) {
+			populate_using_entity_scope_field(ctx, node, field, original_type, level, f);
+		}
+	} else if (t->kind == Type_Array && t->Array.count <= 4) {
+		switch (t->Array.count) {
+		case 4:
+			populate_using_array_index(ctx, node, field, t, str_lit("w"), 3);
+			populate_using_array_index(ctx, node, field, t, str_lit("a"), 3);
+			/*fallthrough*/
+		case 3:
+			populate_using_array_index(ctx, node, field, t, str_lit("z"), 2);
+			populate_using_array_index(ctx, node, field, t, str_lit("b"), 2);
+			/*fallthrough*/
+		case 2:
+			populate_using_array_index(ctx, node, field, t, str_lit("y"), 1);
+			populate_using_array_index(ctx, node, field, t, str_lit("g"), 1);
+			/*fallthrough*/
+		case 1:
+			populate_using_array_index(ctx, node, field, t, str_lit("x"), 0);
+			populate_using_array_index(ctx, node, field, t, str_lit("r"), 0);
+			/*fallthrough*/
+		default:
+			break;
+		}
+	}
+}
+
+gb_internal bool does_field_type_allow_using(Type *t) {
+	t = base_type(t);
+	// A constrained generic field (`$P/Spec`) carries its member layout in the specialization, so
+	// `using`/`#subtype` can promote through it even though the generic itself is not yet concrete.
+	if (t->kind == Type_Generic && t->Generic.specialized != nullptr) {
+		t = base_type(t->Generic.specialized);
+	}
+	if (is_type_struct(t)) {
+		return true;
+	} else if (is_type_array(t)) {
+		return t->Array.count <= 4;
+	} else if (is_type_bit_field(t)) {
+		return true;
+	}
+	return false;
+}
+
+gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entity *> *fields, String **tags, Slice<Ast *> const &params,
+                                     isize init_field_capacity, Type *struct_type, String context) {
+	GB_ASSERT(node->kind == Ast_StructType);
+	GB_ASSERT(struct_type->kind == Type_Struct);
+
+	isize variable_count = 0;
+	for_array(i, params) {
+		Ast *field = params[i];
+		if (ast_node_expect(field, Ast_Field)) {
+			ast_node(f, Field, field);
+			variable_count += gb_max(f->names.count, 1);
+		}
+	}
+
+	init_field_capacity = gb_max(init_field_capacity, variable_count);
+	auto fields_array = array_make<Entity *>(permanent_allocator(), 0, init_field_capacity);
+	auto tags_array   = array_make<String>(permanent_allocator(),   0, init_field_capacity);
+
+	defer (GB_ASSERT(fields_array.count == init_field_capacity));
+
+	// Allocate all at once
+	Entity *entities_to_use = permanent_alloc_array<Entity>(variable_count);
+	isize entities_to_use_index = 0;
+
+	i32 field_src_index = 0;
+	i32 field_group_index = -1;
+	for_array(i, params) {
+		*fields = slice_from_array(fields_array);
+		*tags = tags_array.data;
+		Ast *param = params[i];
+		if (param->kind != Ast_Field) {
+			continue;
+		}
+		field_group_index += 1;
+
+		ast_node(p, Field, param);
+		Ast *type_expr = p->type;
+		Type *type = nullptr;
+		CommentGroup *docs = p->docs;
+		CommentGroup *comment = p->comment;
+
+		if (type_expr != nullptr) {
+			type = check_type_expr(ctx, type_expr, nullptr);
+			if (is_type_polymorphic(type)) {
+				// A field-level polymorphic type (e.g. `struct{x: $T}`) makes the struct polymorphic;
+				// keep the field's generic type so it can be substituted, rather than rejecting it.
+				struct_type->Struct.is_polymorphic = true;
+			}
+		}
+		if (type == nullptr) {
+			error(params[i], "Invalid parameter type");
+			type = t_invalid;
+		}
+		if (is_type_untyped(type)) {
+			if (is_type_untyped_uninit(type)) {
+				error(params[i], "Cannot determine parameter type from ---");
+			} else {
+				error(params[i], "Cannot determine parameter type from a nil");
+			}
+			type = t_invalid;
+		}
+
+		bool is_using = (p->flags&FieldFlag_using) != 0;
+		bool is_subtype = (p->flags&FieldFlag_subtype) != 0;
+
+		for_array(j, p->names) {
+			Ast *name = p->names[j];
+			if (!ast_node_expect2(name, Ast_Ident, Ast_PolyType)) {
+				continue;
+			}
+			if (name->kind == Ast_PolyType) {
+				name = name->PolyType.type;
+			}
+			Token name_token = name->Ident.token;
+
+			// Entity *field = alloc_entity_field(ctx->scope, name_token, type, is_using, field_src_index);
+			Entity *field = &entities_to_use[entities_to_use_index++];
+			INTERNAL_ENTITY_INIT(field, Entity_Variable, ctx->scope, name_token, type);
+
+			field->interned_name.store(name->Ident.interned);
+			field->interned_name_hash.store(name->Ident.hash);
+
+			field->flags |= EntityFlag_Field;
+			if (is_using) field->flags |= EntityFlag_Using;
+			field->Variable.field_index = field_src_index;
+
+			add_entity(ctx, ctx->scope, name, field);
+			field->Variable.field_group_index = field_group_index;
+			if (is_subtype) {
+				field->flags |= EntityFlag_Subtype;
+			}
+
+			if (j == 0) {
+				field->Variable.docs = docs;
+			}
+			if (j+1 == p->names.count) {
+				field->Variable.comment = comment;
+			}
+
+			array_add(&fields_array, field);
+			String tag = p->tag.string;
+			if (tag.len != 0 && !unquote_string(permanent_allocator(), &tag, 0, tag.text[0] == '`')) {
+				error(p->tag, "Invalid string literal");
+				tag = {};
+			}
+			array_add(&tags_array, tag);
+
+			field_src_index += 1;
+		}
+
+
+		if (is_using && p->names.count > 0) {
+			Type *first_type = fields_array[fields_array.count-1]->type;
+			Type *t = base_type(type_deref(first_type));
+
+			if (!does_field_type_allow_using(t) &&
+			    p->names.count >= 1 &&
+			    p->names[0]->kind == Ast_Ident) {
+				Token name_token = p->names[0]->Ident.token;
+				gbString type_str = type_to_string(first_type);
+				error(name_token, "'using' cannot be applied to the field '%.*s' of type '%s'", LIT(name_token.string), type_str);
+				gb_string_free(type_str);
+				continue;
+			}
+
+			populate_using_entity_scope(ctx, node, p, type, 1);
+		}
+
+		if (is_subtype && p->names.count > 0) {
+			Type *first_type = fields_array[fields_array.count-1]->type;
+			Type *t = base_type(type_deref(first_type));
+
+			if (!does_field_type_allow_using(t) &&
+			    p->names.count >= 1 &&
+			    p->names[0]->kind == Ast_Ident) {
+				Token name_token = p->names[0]->Ident.token;
+				gbString type_str = type_to_string(first_type);
+				error(name_token, "'subtype' cannot be applied to the field '%.*s' of type '%s'", LIT(name_token.string), type_str);
+				gb_string_free(type_str);
+			}
+		}
+	}
+
+	*fields = slice_from_array(fields_array);
+	*tags = tags_array.data;
+}
+
+
+gb_internal bool check_custom_align(CheckerContext *ctx, Ast *node, i64 *align_, char const *msg) {
+	GB_ASSERT(align_ != nullptr);
+	Operand o = {};
+	check_expr(ctx, &o, node);
+	if (o.mode != Addressing_Constant) {
+		if (o.mode != Addressing_Invalid) {
+			error(node, "#%s must be a constant", msg);
+		}
+		return false;
+	}
+
+	Type *type = base_type(o.type);
+	if (is_type_untyped(type) || is_type_integer(type)) {
+		if (o.value.kind == ExactValue_Integer) {
+			BigInt v = o.value.value_integer;
+			if (v.used > 1) {
+				gbAllocator a = heap_allocator();
+				String str = big_int_to_string(a, &v);
+				error(node, "#%s too large, %.*s", msg, LIT(str));
+				gb_free(a, str.text);
+				return false;
+			}
+			i64 align = big_int_to_i64(&v);
+			if (align < 1 || !gb_is_power_of_two(cast(isize)align)) {
+				error(node, "#%s must be a power of 2, got %lld", msg, cast(long long)align);
+				return false;
+			}
+			*align_ = align;
+			return true;
+		}
+	}
+
+	error(node, "#%s must be an integer", msg);
+	return false;
+}
+
+
+gb_internal GenTypesData *ensure_polymorphic_record_entity_has_gen_types(CheckerContext *ctx, Type *original_type) {
+	GenTypesData *found_gen_types = nullptr;
+
+	GB_ASSERT(original_type->kind == Type_Named);
+	mutex_lock(&original_type->Named.gen_types_data_mutex);
+	if (original_type->Named.gen_types_data == nullptr) {
+		GenTypesData *gen_types = permanent_alloc_item<GenTypesData>();
+		gen_types->types = array_make<Entity *>(heap_allocator());
+		original_type->Named.gen_types_data = gen_types;
+	}
+	found_gen_types = original_type->Named.gen_types_data;
+
+	mutex_unlock(&original_type->Named.gen_types_data_mutex);
+
+	return found_gen_types;
+}
+
+
+gb_internal void add_polymorphic_record_entity(CheckerContext *ctx, Ast *node, Type *named_type, Type *original_type) {
+	GB_ASSERT(is_type_named(named_type));
+	GB_ASSERT(original_type->kind == Type_Named);
+	gbAllocator a = heap_allocator();
+	Scope *s = ctx->scope->parent;
+
+	AstPackage *pkg = nullptr;
+	if (original_type->Named.type_name && original_type->Named.type_name->pkg) {
+		pkg = original_type->Named.type_name->pkg;
+	}
+
+	if (pkg == nullptr) {
+		// NOTE(bill): if the `pkg` cannot be determined, default to the current context's pkg instead
+		pkg = ctx->pkg;
+	}
+
+	Entity *e = nullptr;
+	{
+		Token token = ast_token(node);
+		token.kind = Token_String;
+		token.string = named_type->Named.name;
+		token.flags |= TokenFlag_Synthesized;
+
+		Ast *node = ast_ident(nullptr, token);
+
+		e = alloc_entity_type_name(s, token, named_type);
+		e->state = EntityState_Resolved;
+
+		// NOTE(bille): the generic's file as its token is not that of whichever instantiated it first
+		e->file = original_type->Named.type_name && original_type->Named.type_name->file ? original_type->Named.type_name->file : ctx->file;
+		e->pkg = pkg;
+		e->TypeName.original_type_for_parapoly = original_type;
+		e->decl_info = ctx->decl;
+		add_entity_use(ctx, node, e);
+	}
+
+	named_type->Named.type_name = e;
+	e->TypeName.objc_class_name = original_type->Named.type_name->TypeName.objc_class_name;
+	// TODO(bill): Is this even correct? Or should the metadata be copied?
+	e->TypeName.objc_metadata = original_type->Named.type_name->TypeName.objc_metadata;
+
+	// NOTE: Do not add polymorphic specializations to gen_types.
+	// Adding one here would just grow gen_types by one per check and make the linear lookups quadratic overall.
+	if (is_type_polymorphic(named_type)) {
+		return;
+	}
+
+	auto *found_gen_types = ensure_polymorphic_record_entity_has_gen_types(ctx, original_type);
+	mutex_lock(&found_gen_types->mutex);
+	defer (mutex_unlock(&found_gen_types->mutex));
+
+	for (Entity *prev : found_gen_types->types) {
+		if (prev == e) {
+			return;
+		}
+	}
+	array_add(&found_gen_types->types, e);
+}
+
+
+bool check_constant_parameter_value(Type *type, Ast *expr) {
+	if (!is_type_constant_type(type)) {
+		gbString str = type_to_string(type);
+		defer (gb_string_free(str));
+		error(expr, "A parameter must be a valid constant type, got %s", str);
+		return true;
+	}
+	return false;
+}
+
+gb_internal Type *check_record_polymorphic_params(CheckerContext *ctx, Ast *polymorphic_params,
+                                                  bool *is_polymorphic_,
+                                                  Array<Operand> *poly_operands) {
+	Type *polymorphic_params_type = nullptr;
+	GB_ASSERT(is_polymorphic_ != nullptr);
+
+	if (polymorphic_params == nullptr) {
+		if (!*is_polymorphic_) {
+			*is_polymorphic_ = polymorphic_params != nullptr && poly_operands == nullptr;
+		}
+		return polymorphic_params_type;
+	}
+
+
+	// bool is_variadic = false;
+	// isize variadic_index = 0;
+	// bool success = false;
+	// isize specialization_count = 0;
+	// polymorphic_params_type = check_get_params(ctx, ctx->scope, polymorphic_params, &is_variadic, &variadic_index, &success, &specialization_count, poly_operands);
+	// if (success) {
+	// 	return nullptr;
+	// }
+
+	bool can_check_fields = true;
+	ast_node(field_list, FieldList, polymorphic_params);
+	Slice<Ast *> params = field_list->list;
+	if (params.count != 0) {
+		isize variable_count = 0;
+		for_array(i, params) {
+			Ast *field = params[i];
+			if (ast_node_expect(field, Ast_Field)) {
+				ast_node(f, Field, field);
+				variable_count += gb_max(f->names.count, 1);
+			}
+		}
+
+		auto entities = array_make<Entity *>(permanent_allocator(), 0, variable_count);
+
+		i32 field_group_index = -1;
+		for_array(i, params) {
+			Ast *param = params[i];
+			if (param->kind != Ast_Field) {
+				continue;
+			}
+			field_group_index += 1;
+			ast_node(p, Field, param);
+			Ast *type_expr = p->type;
+			Ast *default_value = unparen_expr(p->default_value);
+			Type *type = nullptr;
+			bool is_type_param = false;
+			bool is_type_polymorphic_type = false;
+			Type *specialization = nullptr;
+			if (type_expr == nullptr && default_value == nullptr) {
+				error(param, "Expected a type for this parameter");
+				continue;
+			}
+
+			if (type_expr != nullptr) {
+				if (type_expr->kind == Ast_Ellipsis) {
+					type_expr = type_expr->Ellipsis.expr;
+					error(param, "A polymorphic parameter cannot be variadic");
+				}
+				if (type_expr->kind == Ast_TypeidType) {
+					is_type_param = true;
+					if (type_expr->TypeidType.specialization != nullptr) {
+						Ast *s = type_expr->TypeidType.specialization;
+						specialization = check_type(ctx, s);
+					}
+					type = alloc_type_generic(ctx->scope, 0, string_interner_insert(str_lit("")), specialization);
+				} else {
+					type = check_type(ctx, type_expr);
+					if (is_type_polymorphic(type)) {
+						is_type_polymorphic_type = true;
+					}
+				}
+			}
+
+			ParameterValue param_value = {};
+			if (default_value != nullptr)  {
+				Type *out_type = nullptr;
+				param_value = handle_parameter_value(ctx, type, &out_type, default_value, false);
+				if (type == nullptr && out_type != nullptr) {
+					type = out_type;
+				}
+				if (param_value.kind != ParameterValue_Constant && param_value.kind != ParameterValue_Nil) {
+					error(default_value, "Invalid parameter value");
+					param_value = {};
+				}
+			}
+
+
+			if (type == nullptr) {
+				error(params[i], "Invalid parameter type");
+				type = t_invalid;
+			}
+			if (is_type_untyped(type)) {
+				if (is_type_untyped_uninit(type)) {
+					error(params[i], "Cannot determine parameter type from ---");
+				} else {
+					error(params[i], "Cannot determine parameter type from a nil");
+				}
+				type = t_invalid;
+			}
+
+			if (is_type_polymorphic_type && !is_type_proc(type)) {
+				gbString str = type_to_string(type);
+				error(params[i], "Parameter types cannot be polymorphic, got %s", str);
+				gb_string_free(str);
+				type = t_invalid;
+			}
+
+			if (!is_type_param && check_constant_parameter_value(type, params[i])) {
+				// failed
+			}
+
+			Scope *scope = ctx->scope;
+			for_array(j, p->names) {
+				Ast *name = p->names[j];
+				if (!ast_node_expect2(name, Ast_Ident, Ast_PolyType)) {
+					continue;
+				}
+				if (name->kind == Ast_PolyType) {
+					name = name->PolyType.type;
+				}
+				Entity *e = nullptr;
+
+				Token token = name->Ident.token;
+
+				if (poly_operands != nullptr) {
+					Operand operand = {};
+					operand.type = t_invalid;
+					if (entities.count < poly_operands->count) {
+						operand = (*poly_operands)[entities.count];
+					} else if (param_value.kind != ParameterValue_Invalid) {
+						operand.mode = Addressing_Constant;
+						operand.value = param_value.value;
+					}
+					if (is_type_param) {
+						if (is_type_polymorphic(base_type(operand.type))) {
+							*is_polymorphic_ = true;
+							can_check_fields = false;
+						} else if (specialization &&
+						           !subst_check_specialization(ctx, specialization, operand.type, /*modify_type*/true)) {
+							if (!ctx->no_polymorphic_errors) {
+								gbString t = type_to_string(operand.type);
+								gbString s = type_to_string(specialization);
+								error(operand.expr, "Cannot convert type '%s' to the specialization '%s'", t, s);
+								gb_string_free(s);
+								gb_string_free(t);
+							}
+						}
+						e = alloc_entity_type_name(scope, token, operand.type);
+						e->TypeName.is_type_alias = true;
+						e->flags |= EntityFlag_PolyConst;
+					} else {
+						Type *t = operand.type;
+						if (is_type_proc(type)) {
+							t = determine_type_from_polymorphic(ctx, type, operand);
+						}
+						if (is_type_polymorphic(base_type(t))) {
+							*is_polymorphic_ = true;
+							can_check_fields = false;
+						}
+						if (e == nullptr) {
+							e = alloc_entity_const_param(scope, token, t, operand.value, is_type_polymorphic(t));
+							e->Constant.param_value = param_value;
+							e->Constant.field_group_index = field_group_index;
+						}
+					}
+				} else {
+					if (is_type_param) {
+						e = alloc_entity_type_name(scope, token, type);
+						e->TypeName.is_type_alias = true;
+						e->flags |= EntityFlag_PolyConst;
+					} else {
+						e = alloc_entity_const_param(scope, token, type, param_value.value, is_type_polymorphic(type));
+						e->Constant.field_group_index = field_group_index;
+						e->Constant.param_value = param_value;
+					}
+				}
+
+				e->state = EntityState_Resolved;
+				add_entity(ctx, scope, name, e);
+				array_add(&entities, e);
+			}
+		}
+
+		if (entities.count > 0) {
+			Type *tuple = alloc_type_tuple();
+			tuple->Tuple.variables = slice_from_array(entities);
+			polymorphic_params_type = tuple;
+		}
+	}
+
+	if (!*is_polymorphic_) {
+		*is_polymorphic_ = polymorphic_params != nullptr && poly_operands == nullptr;
+	}
+	return polymorphic_params_type;
+}
+
+gb_internal bool check_record_poly_operand_specialization(CheckerContext *ctx, Type *record_type, Array<Operand> *poly_operands, bool *is_polymorphic_) {
+	if (poly_operands == nullptr) {
+		return false;
+	}
+	for (isize i = 0; i < poly_operands->count; i++) {
+		Operand o = (*poly_operands)[i];
+		if (is_type_polymorphic(o.type)) {
+			return false;
+		}
+		if (record_type == o.type) {
+			// NOTE(bill): Cycle
+			return false;
+		}
+		if (o.mode == Addressing_Type) {
+			// NOTE(bill): ANNOYING EDGE CASE FOR `where` clauses
+			// TODO(bill, 2021-03-27): Is this even a valid HACK?!
+			Entity *entity = entity_of_node(o.expr);
+			if (entity != nullptr &&
+			    entity->kind == Entity_TypeName &&
+			    entity->type == t_typeid) {
+			    	*is_polymorphic_ = true;
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+gb_internal Entity *find_polymorphic_record_entity(GenTypesData *found_gen_types, isize param_count, Array<Operand> const &ordered_operands) {
+	for (Entity *e : found_gen_types->types) {
+		Type *t = base_type(e->type);
+		TypeTuple *tuple = get_record_polymorphic_params(t);
+		GB_ASSERT_MSG(tuple != nullptr, "%s :: %s", type_to_string(e->type), type_to_string(t));
+		GB_ASSERT(param_count == tuple->variables.count);
+
+		bool skip = false;
+
+		for (isize j = 0; j < param_count; j++) {
+			Entity *p = tuple->variables[j];
+			Operand o = {};
+			if (j < ordered_operands.count) {
+				o = ordered_operands[j];
+			}
+			if (o.expr == nullptr) {
+				continue;
+			}
+			Entity *oe = entity_of_node(o.expr);
+			if (p == oe) {
+				// NOTE(bill): This is the same type, make sure that it will be be same thing and use that
+				// Saves on a lot of checking too below
+				continue;
+			}
+
+			if (p->kind == Entity_TypeName) {
+				if (is_type_polymorphic(o.type)) {
+					// NOTE(bill): Do not add polymorphic version to the gen_types
+					skip = true;
+					break;
+				}
+				if (!are_types_identical(o.type, p->type)) {
+					skip = true;
+					break;
+				}
+			} else if (p->kind == Entity_Constant) {
+				if (!compare_exact_values(Token_CmpEq, o.value, p->Constant.value)) {
+					skip = true;
+					break;
+				}
+				if (!are_types_identical(o.type, p->type)) {
+					skip = true;
+					break;
+				}
+			} else {
+				GB_PANIC("Unknown entity kind");
+			}
+		}
+		if (!skip) {
+			return e;
+		}
+	}
+	return nullptr;
+};
+
+
+// Set the instantiation's canonical name (e.g. `Foo($T=int)`) before it is published, so a
+// concurrent finder never observes a torn Named.name.
+gb_internal void set_polymorphic_record_instantiation_name(Type *named_type, Type *original_type) {
+	Type *bt = base_type(named_type);
+	if (bt->kind != Type_Struct && bt->kind != Type_Union) {
+		return;
+	}
+	GB_ASSERT(original_type->kind == Type_Named);
+	Entity *e = original_type->Named.type_name;
+	GB_ASSERT(e->kind == Entity_TypeName);
+
+	gbString s = gb_string_make_reserve(heap_allocator(), e->token.string.len+3);
+	s = gb_string_append_fmt(s, "%.*s(", LIT(e->token.string));
+
+	TypeTuple *tuple = get_record_polymorphic_params(bt);
+	if (tuple != nullptr) for_array(i, tuple->variables) {
+		Entity *v = tuple->variables[i];
+		String name = v->token.string;
+		if (i > 0) {
+			s = gb_string_append_fmt(s, ", ");
+		}
+		s = gb_string_append_fmt(s, "$%.*s", LIT(name));
+
+		if (v->kind == Entity_TypeName) {
+			if (v->type != nullptr && v->type->kind != Type_Generic) {
+				s = gb_string_append_fmt(s, "=");
+				s = write_type_to_string(s, v->type, false);
+			}
+		} else if (v->kind == Entity_Constant) {
+			if (v->Constant.value.kind != ExactValue_Invalid) {
+				s = gb_string_append_fmt(s, "=");
+				s = write_exact_value_to_string(s, v->Constant.value);
+			}
+		}
+	}
+	s = gb_string_append_fmt(s, ")");
+
+	String new_name = make_string_c(s);
+	named_type->Named.name = new_name;
+	if (named_type->Named.type_name) {
+		named_type->Named.type_name->token.string = new_name;
+		named_type->Named.type_name->token.flags |= TokenFlag_Synthesized;
+	}
+}
+
+gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly, GenTypesData *poly_gen_types_to_unlock) {
+	GB_ASSERT(is_type_struct(struct_type));
+	ast_node(st, StructType, node);
+
+	struct_type->Struct.checking_thread.store(cast(i32)current_thread_index() + 1);
+	defer (struct_type->Struct.checking_thread.store(0));
+
+	i64 errors_before = error_thread_count();
+
+	String context = str_lit("struct");
+
+	isize min_field_count = 0;
+	for_array(field_index, st->fields) {
+		Ast *field = st->fields[field_index];
+		switch (field->kind) {
+		case_ast_node(f, ValueDecl, field);
+			min_field_count += f->names.count;
+		case_end;
+		case_ast_node(f, Field, field);
+			min_field_count += f->names.count;
+		case_end;
+		}
+	}
+
+	scope_reserve(ctx->scope, min_field_count);
+
+	// Even a one-field `#raw_union` must be marked. RISC-V psABI excludes unions from the hardware
+	// floating-point convention. `struct{union{f32}}` goes in `a0` where `struct{f32}` goes in `fa0`.
+	if (st->is_raw_union) {
+		struct_type->Struct.is_raw_union = true;
+		context = str_lit("struct #raw_union");
+	}
+
+	struct_type->Struct.node           = node;
+	struct_type->Struct.scope          = ctx->scope;
+	struct_type->Struct.is_packed      = st->is_packed;
+	struct_type->Struct.is_all_or_none = st->is_all_or_none;
+	struct_type->Struct.polymorphic_params = check_record_polymorphic_params(
+		ctx, st->polymorphic_params,
+		&struct_type->Struct.is_polymorphic,
+		poly_operands
+	);
+	wait_signal_set(&struct_type->Struct.polymorphic_wait_signal);
+
+	struct_type->Struct.is_poly_specialized = check_record_poly_operand_specialization(ctx, struct_type, poly_operands, &struct_type->Struct.is_polymorphic);
+	if (original_type_for_poly) {
+		GB_ASSERT(named_type != nullptr);
+		// Finalize the name before publishing so no concurrent reader observes a torn name.
+		set_polymorphic_record_instantiation_name(named_type, original_type_for_poly);
+		add_polymorphic_record_entity(ctx, node, named_type, original_type_for_poly);
+
+		// Release before field checking to avoid a cross-record ABBA; finders wait on
+		// fields_wait_signal (set at the end).
+		if (poly_gen_types_to_unlock != nullptr) {
+			mutex_unlock(&poly_gen_types_to_unlock->mutex);
+		}
+	}
+
+
+#define ST_ALIGN(_name) if (st->_name != nullptr) {                                                \
+		if (st->is_packed) {                                                               \
+			error(st->_name, "'#%s' cannot be applied with '#packed'", #_name); \
+		} else {                                                                           \
+			i64 align = 1;                                                             \
+			if (check_custom_align(ctx, st->_name, &align, #_name)) {                  \
+				struct_type->Struct.custom_##_name = align;                        \
+			}                                                                          \
+		}                                                                                  \
+	}
+
+	ST_ALIGN(min_field_align);
+	ST_ALIGN(max_field_align);
+	ST_ALIGN(align);
+	if (struct_type->Struct.custom_align != 0 &&
+		struct_type->Struct.custom_align < struct_type->Struct.custom_min_field_align) {
+		error(st->align, "#align(%lld) is defined to be less than #min_field_align(%lld)",
+		      cast(long long)struct_type->Struct.custom_align,
+		      cast(long long)struct_type->Struct.custom_min_field_align);
+	}
+	if (struct_type->Struct.custom_max_field_align != 0 &&
+	    struct_type->Struct.custom_align > struct_type->Struct.custom_max_field_align) {
+		error(st->align, "#align(%lld) is defined to be greater than #max_field_align(%lld)",
+		      cast(long long)struct_type->Struct.custom_align,
+		      cast(long long)struct_type->Struct.custom_max_field_align);
+	}
+	if (struct_type->Struct.custom_max_field_align != 0 &&
+	    struct_type->Struct.custom_min_field_align > struct_type->Struct.custom_max_field_align) {
+		error(st->align, "#min_field_align(%lld) is defined to be greater than #max_field_align(%lld)",
+		      cast(long long)struct_type->Struct.custom_min_field_align,
+		      cast(long long)struct_type->Struct.custom_max_field_align);
+
+		i64 a = gb_min(struct_type->Struct.custom_min_field_align, struct_type->Struct.custom_max_field_align);
+		i64 b = gb_max(struct_type->Struct.custom_min_field_align, struct_type->Struct.custom_max_field_align);
+		// NOTE(bill): sort them to keep code consistent
+		struct_type->Struct.custom_min_field_align = a;
+		struct_type->Struct.custom_max_field_align = b;
+	}
+
+#undef ST_ALIGN
+
+	if (!struct_type->Struct.is_polymorphic) {
+		if (st->where_clauses.count > 0 && st->polymorphic_params == nullptr) {
+			error(st->where_clauses[0], "'where' clauses can only be used on structures with polymorphic parameters");
+		} else {
+			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &st->where_clauses, true);
+			gb_unused(where_clause_ok);
+		}
+
+		struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+		check_struct_fields(ctx, node, &struct_type->Struct.fields, &struct_type->Struct.tags, st->fields, min_field_count, struct_type, context);
+
+		if (st->is_simple) {
+			bool success = true;
+			for (Entity *f : struct_type->Struct.fields) {
+				if (!is_type_nearly_simple_compare(f->type)) {
+					gbString s = type_to_string(f->type);
+					error(f->token, "'struct #simple' requires all fields to be at least 'nearly simple compare', got %s", s);
+					gb_string_free(s);
+				}
+			}
+			if (success) {
+				struct_type->Struct.is_simple = true;
+			}
+		}
+
+		struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+		wait_signal_set(&struct_type->Struct.fields_wait_signal);
+	}
+
+}
+gb_internal void check_union_type(CheckerContext *ctx, Type *union_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly, GenTypesData *poly_gen_types_to_unlock) {
+	GB_ASSERT(is_type_union(union_type));
+	ast_node(ut, UnionType, node);
+
+	union_type->Union.checking_thread.store(cast(i32)current_thread_index() + 1);
+	defer (union_type->Union.checking_thread.store(0));
+
+	i64 errors_before = error_thread_count();
+
+	union_type->Union.node  = node;
+	union_type->Union.scope = ctx->scope;
+	union_type->Union.polymorphic_params = check_record_polymorphic_params(
+		ctx, ut->polymorphic_params,
+		&union_type->Union.is_polymorphic,
+		poly_operands
+	);
+	wait_signal_set(&union_type->Union.polymorphic_wait_signal);
+
+	union_type->Union.is_poly_specialized = check_record_poly_operand_specialization(ctx, union_type, poly_operands, &union_type->Union.is_polymorphic);
+	if (original_type_for_poly) {
+		GB_ASSERT(named_type != nullptr);
+		// Finalize the name before publishing (see set_polymorphic_record_instantiation_name).
+		set_polymorphic_record_instantiation_name(named_type, original_type_for_poly);
+		add_polymorphic_record_entity(ctx, node, named_type, original_type_for_poly);
+
+		// Release before variant checking to avoid a cross-record ABBA; finders wait on
+		// variants_wait_signal (set at the end). Mirrors check_struct_type.
+		if (poly_gen_types_to_unlock != nullptr) {
+			mutex_unlock(&poly_gen_types_to_unlock->mutex);
+		}
+	}
+
+	if (!union_type->Union.is_polymorphic) {
+		if (ut->where_clauses.count > 0 && ut->polymorphic_params == nullptr) {
+			error(ut->where_clauses[0], "'where' clauses can only be used on unions with polymorphic parameters");
+		} else {
+			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &ut->where_clauses, true);
+			gb_unused(where_clause_ok);
+		}
+		union_type->Union.has_errors.store(error_thread_count() != errors_before);
+	}
+
+	auto variants = array_make<Type *>(permanent_allocator(), 0, ut->variants.count);
+
+	for_array(i, ut->variants) {
+		Ast *node = ut->variants[i];
+		if (union_type->Union.is_polymorphic) {
+			// Skip checking variant types of a template that is unspecialized or instantiated with
+			// polymorphic operands (e.g. `Maybe(Box($T))`): a variant may reference a mutually-recursive
+			// polymorphic union and recurse unboundedly. Mirrors check_struct_type.
+			continue;
+		}
+		Type *t = check_type_expr(ctx, node, nullptr);
+		if (t != nullptr && t != t_invalid) {
+			bool ok = true;
+			t = default_type(t);
+			if (is_type_untyped(t)) {
+				ok = false;
+				gbString str = type_to_string(t);
+				error(node, "Invalid variant type in union '%s'", str);
+				gb_string_free(str);
+			} else if (is_type_empty_union(t)) {
+				Type *base = base_type(t);
+				if (base == nullptr || base->kind != Type_Union || base->Union.node == nullptr) {
+					ok = false;
+					gbString str = type_to_string(t);
+					error(node, "Invalid variant type in union '%s'", str);
+					gb_string_free(str);
+				}
+			} else {
+				for_array(j, variants) {
+					Type *other = variants[j];
+					// Distinct polymorphic type variables (e.g. `$A`, `$B`) are distinct variants even
+					// though are_types_identical treats all unbound generics as equal.
+					if (other->kind == Type_Generic && t->kind == Type_Generic &&
+					    other->Generic.specialized == nullptr && t->Generic.specialized == nullptr &&
+					    !(other->Generic.interned_name == t->Generic.interned_name)) {
+						continue;
+					}
+					if (union_variant_index_types_equal(t, other)) {
+						ok = false;
+						ERROR_BLOCK();
+						gbString str = type_to_string(t);
+						error(node, "Duplicate variant type '%s'", str);
+						if (j < ut->variants.count) {
+							error_line("\tPrevious found at %s\n", token_pos_to_string(ast_token(ut->variants[j]).pos));
+						}
+						gb_string_free(str);
+						break;
+					}
+				}
+			}
+			if (ok) {
+				array_add(&variants, t);
+
+				if (ut->kind == UnionType_shared_nil) {
+					if (!type_has_nil(t)) {
+						gbString s = type_to_string(t);
+						error(node, "Each variant of a union with #shared_nil must have a 'nil' value, got %s", s);
+						gb_string_free(s);
+					}
+				}
+			}
+		}
+	}
+
+	union_type->Union.variants = slice_from_array(variants);
+	union_type->Union.kind = ut->kind;
+	switch (ut->kind) {
+	case UnionType_no_nil:
+		if (union_type->Union.is_polymorphic) {
+			GB_ASSERT(variants.count == 0);
+			if (ut->variants.count != 1) {
+				break;
+			}
+		}
+		if (variants.count < 2) {
+			error(node, "A union with #no_nil must have at least 2 variants");
+		}
+		break;
+	}
+
+	if (ut->align != nullptr) {
+		i64 custom_align = 1;
+		if (check_custom_align(ctx, ut->align, &custom_align, "align")) {
+			if (variants.count == 0) {
+				error(ut->align, "An empty union cannot have a custom alignment");
+			} else {
+				union_type->Union.custom_align = custom_align;
+			}
+		}
+	}
+
+	// An anonymous union with a polymorphic variant (e.g. `union{$T, int}`) is itself polymorphic.
+	// is_type_polymorphic(Union) only reads this flag (its variant loop is disabled to avoid a
+	// recursion bug), so compute it once here from the resolved variants.
+	if (!union_type->Union.is_polymorphic) {
+		for (Type *v : union_type->Union.variants) {
+			if (is_type_polymorphic(v)) {
+				union_type->Union.is_polymorphic = true;
+				break;
+			}
+		}
+	}
+
+	union_type->Union.has_errors.store(error_thread_count() != errors_before);
+	wait_signal_set(&union_type->Union.variants_wait_signal);
+}
+
+gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *named_type, Ast *node) {
+	ast_node(et, EnumType, node);
+	GB_ASSERT(is_type_enum(enum_type));
+
+	enum_type->Enum.base_type = t_int;
+	enum_type->Enum.scope = ctx->scope;
+
+	Type *base_type = t_int;
+	bool base_type_implicit = (unparen_expr(et->base_type) == nullptr);
+	if (!base_type_implicit) {
+		base_type = check_type(ctx, et->base_type);
+	}
+
+	if (base_type == nullptr || base_type == t_invalid || !is_type_integer(base_type)) {
+		error(node, "Base type for enumeration must be an integer");
+		return;
+	}
+	if (is_type_enum(base_type)) {
+		error(node, "Base type for enumeration cannot be another enumeration");
+		return;
+	}
+
+	if (is_type_integer_128bit(base_type)) {
+		error(node, "Base type for enumeration cannot be a 128-bit integer");
+		return;
+	}
+
+	// NOTE(bill): Must be up here for the 'check_init_constant' system
+	enum_type->Enum.base_type = base_type;
+
+	auto fields = array_make<Entity *>(permanent_allocator(), 0, et->fields.count);
+
+	Type *constant_type = enum_type;
+	if (named_type != nullptr) {
+		constant_type = named_type;
+	}
+
+	ExactValue iota = exact_value_i64(-1);
+	ExactValue min_value = exact_value_i64(0);
+	ExactValue max_value = exact_value_i64(0);
+	isize min_value_index = 0;
+	isize max_value_index = 0;
+	bool min_value_set = false;
+	bool max_value_set = false;
+
+	scope_reserve(ctx->scope, et->fields.count);
+
+	// Allocate all at once
+	Entity *entities_to_use = permanent_alloc_array<Entity>(et->fields.count);
+	isize entities_to_use_index = 0;
+
+	for_array(i, et->fields) {
+		Ast *field = et->fields[i];
+		Ast *ident = nullptr;
+		Ast *init = nullptr;
+		u32 entity_flags = 0;
+		if (field->kind != Ast_EnumFieldValue) {
+			error(field, "An enum field's name must be an identifier");
+			continue;
+		}
+		ident = field->EnumFieldValue.name;
+		init = field->EnumFieldValue.value;
+		if (ident == nullptr || ident->kind != Ast_Ident) {
+			error(field, "An enum field's name must be an identifier");
+			continue;
+		}
+		CommentGroup *docs    = field->EnumFieldValue.docs;
+		CommentGroup *comment = field->EnumFieldValue.comment;
+
+		String name = ident->Ident.token.string;
+
+		if (init != nullptr) {
+			Operand o = {};
+			check_expr(ctx, &o, init);
+			if (o.mode != Addressing_Constant) {
+				error(init, "Enumeration value must be a constant");
+				o.mode = Addressing_Invalid;
+			}
+			if (o.mode != Addressing_Invalid) {
+				check_assignment(ctx, &o, constant_type, str_lit("enumeration"));
+			}
+			if (o.mode != Addressing_Invalid) {
+				iota = o.value;
+			} else {
+				iota = exact_binary_operator_value(Token_Add, iota, exact_value_i64(1));
+			}
+		} else {
+			iota = exact_binary_operator_value(Token_Add, iota, exact_value_i64(1));
+			entity_flags |= EntityConstantFlag_ImplicitEnumValue;
+
+			if (!base_type_implicit) {
+				int bits_iota = mp_count_bits(&iota.value_integer);
+				int bits_type = (int)type_size_of(base_type) * 8;
+				if (bits_iota > bits_type) {
+					ERROR_BLOCK();
+
+					gbString a = expr_to_string(ident);
+					gbString b = exact_value_to_string(iota);
+					gbString c = type_to_string(base_type);
+					gbString d = type_to_string(constant_type);
+					defer(
+						gb_string_free(a);
+						gb_string_free(b);
+						gb_string_free(c);
+						gb_string_free(d);
+					);
+
+					error(ident, "'%s' gets value '%s' which overflows base type '%s' of enumeration '%s'", a, b, c, d);
+				}
+			}
+		}
+
+
+		// NOTE(bill): Skip blank identifiers
+		if (is_blank_ident(name)) {
+			continue;
+		}
+
+		if (min_value_set) {
+			if (compare_exact_values(Token_Gt, min_value, iota)) {
+				min_value_index = i;
+				min_value = iota;
+			}
+		} else {
+			min_value_index = i;
+			min_value = iota;
+			min_value_set = true;
+		}
+		if (max_value_set) {
+			if (compare_exact_values(Token_Lt, max_value, iota)) {
+				max_value_index = i;
+				max_value = iota;
+			}
+		} else {
+			max_value_index = i;
+			max_value = iota;
+			max_value_set = true;
+		}
+
+		// Entity *e = alloc_entity_constant(ctx->scope, ident->Ident.token, constant_type, iota);
+		Entity *e = &entities_to_use[entities_to_use_index++];
+		Token token = ident->Ident.token;
+		INTERNAL_ENTITY_INIT(e, Entity_Constant, ctx->scope, token, constant_type);
+
+		e->interned_name.store(ident->Ident.interned);
+		e->interned_name_hash.store(ident->Ident.hash);
+
+		e->Constant.value = iota;
+		e->identifier = ident;
+		e->flags |= EntityFlag_Visited;
+		e->state = EntityState_Resolved;
+		e->Constant.flags |= entity_flags;
+		e->Constant.docs = docs;
+		e->Constant.comment = comment;
+		e->Constant.init_expr = init;
+
+		auto interned = entity_interned_name(e);
+
+		if (scope_lookup_current(ctx->scope, interned) != nullptr) {
+			error(ident, "'%.*s' is already declared in this enumeration", LIT(name));
+		} else {
+			add_entity(ctx, ctx->scope, nullptr, e);
+			add_semantic_ident(ctx->info, ident, e, true);
+			array_add(&fields, e);
+			// TODO(bill): Should I add a use for the enum value?
+			add_entity_use(ctx, field, e);
+		}
+	}
+	GB_ASSERT(fields.count <= et->fields.count);
+
+
+	enum_type->Enum.fields = fields;
+	*enum_type->Enum.min_value = min_value;
+	*enum_type->Enum.max_value = max_value;
+
+	enum_type->Enum.min_value_index = min_value_index;
+	enum_type->Enum.max_value_index = max_value_index;
+}
+
+
+gb_internal void check_bit_field_type(CheckerContext *ctx, Type *bit_field_type, Type *named_type, Ast *node) {
+	ast_node(bf, BitFieldType, node);
+	GB_ASSERT(is_type_bit_field(bit_field_type));
+
+	Type *backing_type = check_type(ctx, bf->backing_type);
+
+	bit_field_type->BitField.backing_type = backing_type ? backing_type : t_u8;
+	bit_field_type->BitField.scope = ctx->scope;
+
+	if (backing_type == nullptr) {
+		error(bf->backing_type, "Backing type for a bit_field must be an integer or an array of an integer");
+		return;
+	}
+	// A polymorphic backing (e.g. `bit_field $T {...}`) has an unknown size/endianness until it is
+	// instantiated, so the backing-dependent validations below are skipped for it.
+	bool backing_is_polymorphic = is_type_polymorphic(backing_type);
+	if (!backing_is_polymorphic && !is_valid_bit_field_backing_type(backing_type)) {
+		error(bf->backing_type, "Backing type for a bit_field must be an integer or an array of an integer");
+		return;
+	}
+
+	auto fields    = array_make<Entity *>(permanent_allocator(), 0, bf->fields.count);
+	auto bit_sizes = array_make<u8>      (permanent_allocator(), 0, bf->fields.count);
+	auto tags      = array_make<String>  (permanent_allocator(), 0, bf->fields.count);
+
+	u64 maximum_bit_size = backing_is_polymorphic ? ~cast(u64)0 : 8 * type_size_of(backing_type);
+	u64 total_bit_size = 0;
+
+	for_array(i, bf->fields) {
+		i32 field_src_index = cast(i32)i;
+		Ast *field = bf->fields[i];
+		if (field->kind != Ast_BitFieldField) {
+			error(field, "Invalid AST for a bit_field");
+			continue;
+		}
+		ast_node(f, BitFieldField, field);
+		if (f->name == nullptr || f->name->kind != Ast_Ident) {
+			error(field, "A bit_field's field name must be an identifier");
+			continue;
+		}
+		CommentGroup *docs    = f->docs;
+		CommentGroup *comment = f->comment;
+
+		String name = f->name->Ident.token.string;
+		InternedString interned = f->name->Ident.interned;
+
+		if (f->type == nullptr) {
+			error(field, "A bit_field's field must have a type");
+			continue;
+		}
+
+		Type *type = check_type(ctx, f->type);
+		if (type_size_of(type) > 8) {
+			error(f->type, "The type of a bit_field's field must be <= 8 bytes, got %lld", cast(long long)type_size_of(type));
+		}
+
+		if (is_type_untyped(type)) {
+			gbString s = type_to_string(type);
+			error(f->type, "The type of a bit_field's field must be a typed integer, enum, or boolean, got %s", s);
+			gb_string_free(s);
+		} else if (!(is_type_integer(type) || is_type_enum(type) || is_type_boolean(type))) {
+			gbString s = type_to_string(type);
+			error(f->type, "The type of a bit_field's field must be an integer, enum, or boolean, got %s", s);
+			gb_string_free(s);
+		}
+
+		if (f->bit_size == nullptr) {
+			error(field, "A bit_field's field must have a specified bit size");
+			continue;
+		}
+
+
+		Operand o = {};
+		check_expr(ctx, &o, f->bit_size);
+		if (o.mode != Addressing_Constant) {
+			error(f->bit_size, "A bit_field's specified bit size must be a constant");
+			o.mode = Addressing_Invalid;
+		}
+		if (o.value.kind == ExactValue_Float || o.value.kind == ExactValue_Rational) {
+			o.value = exact_value_to_integer(o.value);
+		}
+		if (f->bit_size->kind == Ast_BinaryExpr && f->bit_size->BinaryExpr.op.kind == Token_Or) {
+			gbString s = expr_to_string(f->bit_size);
+			error(f->bit_size, "Wrap the expression in parentheses, e.g. (%s)", s);
+			gb_string_free(s);
+		}
+
+		if (o.mode == Addressing_Constant) {
+			convert_to_typed(ctx, &o, t_int);
+			if (o.mode == Addressing_Invalid) {
+				o.value = exact_value_i64(1);
+			}
+		}
+
+		ExactValue bit_size = o.value;
+
+		if (bit_size.kind != ExactValue_Integer) {
+			gbString s = expr_to_string(f->bit_size);
+			error(f->bit_size, "Expected an integer constant value for the specified bit size, got %s", s);
+			gb_string_free(s);
+		}
+
+		if (scope_lookup_current(ctx->scope, interned) != nullptr) {
+			error(f->name, "'%.*s' is already declared in this bit_field", LIT(name));
+		} else {
+			i64 bit_size_i64 = exact_value_to_i64(bit_size);
+			u8 bit_size_u8 = 0;
+			if (bit_size_i64 <= 0) {
+				error(f->bit_size, "A bit_field's specified bit size cannot be <= 0, got %lld", cast(long long)bit_size_i64);
+				bit_size_i64 = 1;
+			}
+			if (bit_size_i64 > 64) {
+				error(f->bit_size, "A bit_field's specified bit size cannot exceed 64 bits, got %lld", cast(long long)bit_size_i64);
+				bit_size_i64 = 64;
+			}
+			i64 sz = 8*type_size_of(type);
+			if (bit_size_i64 > sz) {
+				error(f->bit_size, "A bit_field's specified bit size cannot exceed its type, got %lld, expect <=%lld", cast(long long)bit_size_i64, cast(long long)sz);
+				bit_size_i64 = sz;
+			}
+
+			bit_size_u8 = cast(u8)bit_size_i64;
+
+			Entity *e = alloc_entity_field(ctx->scope, f->name->Ident.token, type, false, field_src_index);
+			e->Variable.docs    = docs;
+			e->Variable.comment = comment;
+			e->Variable.bit_field_bit_size = bit_size_u8;
+			e->flags |= EntityFlag_BitFieldField;
+
+			add_entity(ctx, ctx->scope, nullptr, e);
+			add_semantic_ident(ctx->info, f->name, e, true);
+			array_add(&fields, e);
+			array_add(&bit_sizes, bit_size_u8);
+
+			String tag = f->tag.string;
+			if (tag.len != 0 && !unquote_string(permanent_allocator(), &tag, 0, tag.text[0] == '`')) {
+				error(f->tag, "Invalid string literal");
+				tag = {};
+			}
+			array_add(&tags, tag);
+
+			add_entity_use(ctx, field, e);
+
+			total_bit_size += bit_size_u8;
+		}
+	}
+
+	GB_ASSERT(fields.count <= bf->fields.count);
+
+	auto bit_offsets = permanent_slice_make<i64>(fields.count);
+	i64 curr_offset = 0;
+	for_array(i, bit_sizes) {
+		bit_offsets[i] = curr_offset;
+		curr_offset += cast(i64)bit_sizes[i];
+	}
+
+	if (total_bit_size > maximum_bit_size) {
+		gbString s = type_to_string(backing_type);
+		error(node, "The total bit size of a bit_field's fields (%llu) must fit into its backing type's (%s) bit size of %llu",
+		      cast(unsigned long long)total_bit_size,
+		      s,
+		      cast(unsigned long long)maximum_bit_size);
+		gb_string_free(s);
+	}
+
+	enum EndianKind {
+		Endian_Unknown,
+		Endian_Native,
+		Endian_Little,
+		Endian_Big,
+	};
+	auto const &determine_endian_kind = [](Type *type) -> EndianKind {
+		if (is_type_boolean(type)) {
+			// NOTE(bill): it doesn't matter, and when it does,
+			// that api is absolutely stupid
+			return Endian_Unknown;
+		} else if (type_size_of(type) < 2) {
+			return Endian_Unknown;
+		} else if (is_type_endian_specific(type)) {
+			if (is_type_endian_little(type)) {
+				return Endian_Little;
+			} else {
+				return Endian_Big;
+			}
+		}
+		return Endian_Native;
+	};
+
+	Type *backing_type_elem = backing_is_polymorphic ? backing_type : core_array_type(backing_type);
+	i64 backing_type_elem_size = backing_is_polymorphic ? 0 : type_size_of(backing_type_elem);
+	EndianKind backing_type_endian_kind = backing_is_polymorphic ? Endian_Unknown : determine_endian_kind(backing_type_elem);
+	EndianKind endian_kind = Endian_Unknown;
+	for (Entity *f : fields) {
+		EndianKind field_kind = determine_endian_kind(f->type);
+		i64 field_size = type_size_of(f->type);
+
+		if (field_kind && backing_type_endian_kind != field_kind && field_size > 1 && backing_type_elem_size > 1) {
+			error(f->token, "All 'bit_field' field types must match the same endian kind as the backing type, i.e. all native, all little, or all big");
+		}
+
+		if (endian_kind == Endian_Unknown) {
+			endian_kind = field_kind;
+		} else if (field_kind && endian_kind != field_kind && field_size > 1) {
+			error(f->token, "All 'bit_field' field types must be of the same endian variety, i.e. all native, all little, or all big");
+		}
+	}
+
+	#if 0 // Reconsider at a later date
+	if (bit_sizes.count > 0 && is_type_integer(backing_type)) {
+		bool all_booleans = is_type_boolean(fields[0]->type);
+		bool all_ones = bit_sizes[0] == 1;
+		if (all_ones && all_booleans) {
+			for_array(i, bit_sizes) {
+				all_ones = bit_sizes[i] == 1;
+				if (!all_ones) {
+					break;
+				}
+				all_booleans = is_type_boolean(fields[i]->type);
+				if (!all_booleans) {
+					break;
+				}
+			}
+			if (all_ones && all_booleans) {
+				if (ast_file_vet_style(ctx->file)) {
+					char const *msg = "This 'bit_field' is better expressed as a 'bit_set' since all of the fields are booleans, of 1-bit in size, and the backing type is an integer (-vet-style)";
+					error(node, msg);
+				} else {
+					char const *msg = "This 'bit_field' might be better expressed as a 'bit_set' since all of the fields are booleans, of 1-bit in size, and the backing type is an integer";
+					warning(node, msg);
+				}
+			}
+		}
+	}
+	#endif
+
+	bit_field_type->BitField.fields      = slice_from_array(fields);
+	bit_field_type->BitField.bit_sizes   = slice_from_array(bit_sizes);
+	bit_field_type->BitField.bit_offsets = bit_offsets;
+	bit_field_type->BitField.tags        = tags.data;
+}
+
+gb_internal bool is_type_valid_bit_set_range(Type *t) {
+	if (is_type_integer(t)) {
+		return true;
+	}
+	if (is_type_rune(t)) {
+		return true;
+	}
+	return false;
+}
+
+gb_internal Type *narrowest_integer_type_for_bits(Type *like, i64 needed_bits) {
+	if (needed_bits > 128) {
+		return nullptr;
+	}
+
+	bool is_unsigned = is_type_unsigned(like);
+	bool little = false;
+	bool big    = false;
+
+	Type *bt = core_type(like);
+	if (bt != nullptr && bt->kind == Type_Basic) {
+		little = (bt->Basic.flags & BasicFlag_EndianLittle) != 0;
+		big    = (bt->Basic.flags & BasicFlag_EndianBig)    != 0;
+	}
+
+	Type *native_u[] = {t_u8, t_u16,   t_u32,   t_u64,   t_u128};
+	Type *native_i[] = {t_i8, t_i16,   t_i32,   t_i64,   t_i128};
+	Type *little_u[] = {      t_u16le, t_u32le, t_u64le, t_u128le};
+	Type *little_i[] = {      t_i16le, t_i32le, t_i64le, t_i128le};
+	Type *big_u[]    = {      t_u16be, t_u32be, t_u64be, t_u128be};
+	Type *big_i[]    = {      t_i16be, t_i32be, t_i64be, t_i128be};
+
+	Type **candidates = native_u;
+	isize candidate_count = gb_count_of(native_u);
+	if (little) {
+		candidates      = is_unsigned ? little_u : little_i;
+		candidate_count = is_unsigned ? gb_count_of(little_u) : gb_count_of(little_i);
+	} else if (big) {
+		candidates      = is_unsigned ? big_u : big_i;
+		candidate_count = is_unsigned ? gb_count_of(big_u) : gb_count_of(big_i);
+	} else {
+		candidates      = is_unsigned ? native_u : native_i;
+		candidate_count = is_unsigned ? gb_count_of(native_u) : gb_count_of(native_i);
+	}
+
+	for (isize i = 0; i < candidate_count; i++) {
+		if (8*type_size_of(candidates[i]) >= needed_bits) {
+			return candidates[i];
+		}
+	}
+	return nullptr;
+}
+
+gb_internal void suggest_bit_set_backing_type(Ast *elem, Type *underlying, i64 upper, bool note_lower_bound_forced) {
+	i64 const needed_bits = upper + 1;
+
+	Type *unit = t_u64;
+	if (underlying != nullptr) {
+		Type *bt = base_type(underlying);
+		unit = (bt->kind == Type_Array) ? bt->Array.elem : underlying;
+	}
+	i64 const unit_bits = 8*type_size_of(unit);
+	i64 const count = unit_bits > 0 ? (needed_bits + unit_bits - 1) / unit_bits : 1;
+
+	Type *scalar = narrowest_integer_type_for_bits(unit, needed_bits);
+	bool  show_scalar = scalar != nullptr;
+	bool  show_array  = count >= 2;
+
+	gbString es = expr_to_string(elem);
+	gbString us = type_to_string(unit);
+
+	char const *lead = underlying != nullptr
+		? "\tSuggestion: A larger backing type is required, e.g. "
+		: "\tSuggestion: An explicit backing integer or array type may be specified to allow for a larger range, e.g. ";
+
+	if (show_scalar && show_array) {
+		gbString ss = type_to_string(scalar);
+		error_line("%s'bit_set[%s; %s]' or 'bit_set[%s; [%lld]%s]'\n", lead, es, ss, es, cast(long long)count, us);
+		gb_string_free(ss);
+	} else if (show_scalar) {
+		gbString ss = type_to_string(scalar);
+		error_line("%s'bit_set[%s; %s]'\n", lead, es, ss);
+		gb_string_free(ss);
+	} else {
+		error_line("%s'bit_set[%s; [%lld]%s]'\n", lead, es, cast(long long)count, us);
+	}
+
+	if (note_lower_bound_forced) {
+		error_line("\t            Note: an explicit backing type forces the lower bound of the bit_set to be 0\n");
+	}
+
+	gb_string_free(us);
+	gb_string_free(es);
+}
+
+gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_type, Ast *node) {
+	ast_node(bs, BitSetType, node);
+	GB_ASSERT(type->kind == Type_BitSet);
+	type->BitSet.node = node;
+	type->BitSet.elem = t_invalid;
+
+	/* i64 const DEFAULT_BITS = cast(i64)(8*build_context.word_size); */
+	i64 const MAX_BITS = 128;
+
+	Ast *base = unparen_expr(bs->elem);
+	if (is_ast_range(base)) {
+		ast_node(be, BinaryExpr, base);
+		Operand lhs = {};
+		Operand rhs = {};
+		check_expr(c, &lhs, be->left);
+		check_expr(c, &rhs, be->right);
+		if (lhs.mode == Addressing_Invalid || rhs.mode == Addressing_Invalid) {
+			return;
+		}
+		convert_to_typed(c, &lhs, rhs.type);
+		if (lhs.mode == Addressing_Invalid) {
+			return;
+		}
+		convert_to_typed(c, &rhs, lhs.type);
+		if (rhs.mode == Addressing_Invalid) {
+			return;
+		}
+		if (!are_types_identical(lhs.type, rhs.type)) {
+			if (lhs.type != t_invalid &&
+			    rhs.type != t_invalid) {
+				gbString xt = type_to_string(lhs.type);
+				gbString yt = type_to_string(rhs.type);
+				gbString expr_str = expr_to_string(bs->elem);
+				error(bs->elem, "Mismatched types in range '%s' : '%s' vs '%s'", expr_str, xt, yt);
+				gb_string_free(expr_str);
+				gb_string_free(yt);
+				gb_string_free(xt);
+			}
+			return;
+		}
+
+		if (!is_type_valid_bit_set_range(lhs.type)) {
+			gbString str = type_to_string(lhs.type);
+			error(bs->elem, "'%s' is invalid for an interval expression, expected an integer or rune", str);
+			gb_string_free(str);
+			return;
+		}
+
+		if (lhs.mode != Addressing_Constant || rhs.mode != Addressing_Constant) {
+			error(bs->elem, "Intervals must be constant values");
+			return;
+		}
+
+		ExactValue iv = exact_value_to_integer(lhs.value);
+		ExactValue jv = exact_value_to_integer(rhs.value);
+		GB_ASSERT(iv.kind == ExactValue_Integer);
+		GB_ASSERT(jv.kind == ExactValue_Integer);
+
+		BigInt i = iv.value_integer;
+		BigInt j = jv.value_integer;
+		if (big_int_cmp(&i, &j) > 0) {
+			gbAllocator a = heap_allocator();
+			String si = big_int_to_string(a, &i);
+			String sj = big_int_to_string(a, &j);
+			error(bs->elem, "Lower interval bound larger than upper bound, %.*s .. %.*s", LIT(si), LIT(sj));
+			gb_free(a, si.text);
+			gb_free(a, sj.text);
+			return;
+		}
+
+		Type *t = default_type(lhs.type);
+		if (bs->underlying != nullptr) {
+			Type *u = check_type(c, bs->underlying);
+			if (!is_valid_bit_field_backing_type(u)) {
+				gbString ts = type_to_string(u);
+				error(bs->underlying, "Expected an underlying integer or array of integers for the bit set, got %s", ts);
+				gb_string_free(ts);
+				return;
+			}
+			type->BitSet.underlying = u;
+		}
+
+		if (!check_representable_as_constant(c, iv, t, nullptr)) {
+			gbAllocator a = heap_allocator();
+			String s = big_int_to_string(a, &i);
+			gbString ts = type_to_string(t);
+			error(bs->elem, "%.*s is not representable by %s", LIT(s), ts);
+			gb_string_free(ts);
+			gb_free(a, s.text);
+			return;
+		}
+		if (!check_representable_as_constant(c, jv, t, nullptr)) {
+			gbAllocator a = heap_allocator();
+			String s = big_int_to_string(a, &j);
+			gbString ts = type_to_string(t);
+			error(bs->elem, "%.*s is not representable by %s", LIT(s), ts);
+			gb_string_free(ts);
+			gb_free(a, s.text);
+			return;
+		}
+		i64 lower = big_int_to_i64(&i);
+		i64 upper = big_int_to_i64(&j);
+
+		i64 actual_lower = lower;
+		i64 bits = MAX_BITS;
+		if (type->BitSet.underlying != nullptr) {
+			bits = 8*type_size_of(type->BitSet.underlying);
+
+			if (lower > 0) {
+				actual_lower = 0;
+			} else if (lower < 0) {
+				error(bs->elem, "bit_set does not allow a negative lower bound (%lld) when an underlying type is set", cast(long long)lower);
+			}
+		}
+
+		i64 bits_required = upper-actual_lower;
+		switch (be->op.kind) {
+		case Token_Ellipsis:
+		case Token_RangeFull:
+			bits_required += 1;
+			break;
+		}
+		bool is_valid = true;
+
+		switch (be->op.kind) {
+		case Token_Ellipsis:
+		case Token_RangeFull:
+			if (upper - lower >= bits) {
+				is_valid = false;
+			}
+			break;
+		case Token_RangeHalf:
+			if (upper - lower > bits) {
+				is_valid = false;
+			}
+			upper -= 1;
+			break;
+		}
+		if (!is_valid) {
+			ERROR_BLOCK();
+			if (actual_lower != lower) {
+				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", cast(long long)bits, cast(long long)bits_required);
+				suggest_bit_set_backing_type(bs->elem, type->BitSet.underlying, upper, /*note_lower_bound_forced*/false);
+			} else {
+				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", cast(long long)bits, cast(long long)bits_required);
+				if (lower >= 0) {
+					suggest_bit_set_backing_type(bs->elem, type->BitSet.underlying, upper, /*note_lower_bound_forced*/lower > 0);
+				}
+			}
+		}
+
+		type->BitSet.elem  = t;
+		type->BitSet.lower = lower;
+		type->BitSet.upper = upper;
+	} else {
+		Type *elem = check_type_expr(c, bs->elem, nullptr);
+
+		type->BitSet.elem = elem;
+		if (!is_type_valid_bit_set_elem(elem)) {
+			error(bs->elem, "Expected an enum type for a bit_set");
+		} else {
+			Type *et = base_type(elem);
+			if (et->kind == Type_Enum) {
+				if (!is_type_integer(et->Enum.base_type)) {
+					error(bs->elem, "Enum type for bit_set must be an integer");
+					return;
+				}
+				i64 lower = I64_MAX;
+				i64 upper = I64_MIN;
+
+				for_array(i, et->Enum.fields) {
+					Entity *e = et->Enum.fields[i];
+					if (e->kind != Entity_Constant) {
+						continue;
+					}
+					ExactValue value = exact_value_to_integer(e->Constant.value);
+					GB_ASSERT(value.kind == ExactValue_Integer);
+					// NOTE(bill): enum types should be able to store i64 values
+					i64 x = big_int_to_i64(&value.value_integer);
+					lower = gb_min(lower, x);
+					upper = gb_max(upper, x);
+				}
+				if (et->Enum.fields.count == 0) {
+					lower = 0;
+					upper = 0;
+				}
+
+				GB_ASSERT(lower <= upper);
+
+				bool lower_changed = false;
+				i64 bits = MAX_BITS
+;				if (bs->underlying != nullptr) {
+					Type *u = check_type(c, bs->underlying);
+					if (!is_valid_bit_field_backing_type(u)) {
+						gbString ts = type_to_string(u);
+						error(bs->underlying, "Expected an underlying integer or array of integers for the bit set, got %s", ts);
+						gb_string_free(ts);
+						return;
+					}
+					type->BitSet.underlying = u;
+					bits = 8*type_size_of(u);
+
+					if (lower > 0) {
+						lower = 0;
+						lower_changed = true;
+					} else if (lower < 0) {
+						gbString s = type_to_string(elem);
+						error(bs->elem, "bit_set does not allow a negative lower bound (%lld) of the element type '%s' when an underlying type is set", cast(long long)lower, s);
+						gb_string_free(s);
+					}
+				}
+
+				if (upper - lower >= bits) {
+					ERROR_BLOCK();
+					i64 bits_required = upper-lower+1;
+					if (lower_changed) {
+						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", cast(long long)bits, cast(long long)bits_required);
+						suggest_bit_set_backing_type(bs->elem, type->BitSet.underlying, upper, /*note_lower_bound_forced*/false);
+					} else {
+						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", cast(long long)bits, cast(long long)bits_required);
+						if (lower >= 0) {
+							suggest_bit_set_backing_type(bs->elem, type->BitSet.underlying, upper, /*note_lower_bound_forced*/lower > 0);
+						}
+					}
+				}
+
+				type->BitSet.lower = lower;
+				type->BitSet.upper = upper;
+			}
+		}
+	}
+}
+
+
+// If `specialization` is a polymorphic-record specialization that has been published into
+// its originating record's `gen_types` cache, return that cache's `GenTypesData`. Its
+// `RecursiveMutex` guards concurrent `find_polymorphic_record_entity` reads, so the
+// in-place finalization below must hold it. Returns nullptr otherwise.
+gb_internal GenTypesData *gen_types_data_of_specialization(Type *specialization) {
+	if (specialization != nullptr &&
+	    specialization->kind == Type_Named &&
+	    specialization->Named.type_name != nullptr) {
+		Type *orig = specialization->Named.type_name->TypeName.original_type_for_parapoly;
+		if (orig != nullptr && orig->kind == Type_Named) {
+			return orig->Named.gen_types_data;
+		}
+	}
+	return nullptr;
+}
+
+// NOTE(bill: 2026-10-01)
+//
+// The substitution engine is the way a polymorphic parameter type is resolved or a `$T: Constraint` specialization is checked:
+//     `subst_unify` matches a pattern against a source PURELY (no node/entity mutation), accumulating bindings
+//     `subst_apply` reconstructs the instantiated type by CONSTRUCTION
+//     `subst_bind_entities` binds the poly-scope entities
+//     `subst_unify_constraint` handles specialization conformance
+//
+//
+// The old in-place mutator (is_polymorphic_type_assignable / check_type_specialization_to)
+// has been removed a pattern the engine cannot match is a definite non-match,
+// surfaced as a call-site error rather than silently mishandled.
+// The old mutator a lovely mess of `memmove` nonsense which was quite fragile,
+// so changing it to this should make things a heck of a lot more stable in the long run.
+
+enum SubstResult : u8 {
+	Subst_Unhandled,
+	Subst_NoMatch,
+	Subst_Matched,
+};
+
+enum PolyBindKind : u8 {
+	PolyBind_Type,
+	PolyBind_Value,
+	PolyBind_EnumArray,
+};
+
+struct PolyBinding {
+	Entity *     key;
+	PolyBindKind kind;
+	Type *       type;       // PolyBind_Type: bound type; PolyBind_EnumArray: source EnumeratedArray
+	ExactValue   value;      // PolyBind_Value: the constant (array/matrix/simd count, or a record const param of any type)
+	Type *       value_type; // PolyBind_Value: entity type the binding gives the constant
+};
+struct PolySubst {
+	Array<PolyBinding> items;
+};
+
+gb_internal Entity *poly_generic_entity(Type *g) {
+	GB_ASSERT(g->kind == Type_Generic);
+	if (g->Generic.scope == nullptr) {
+		return nullptr;
+	}
+	return scope_lookup(g->Generic.scope, g->Generic.interned_name, 0);
+}
+gb_internal PolyBinding *poly_subst_find(PolySubst *s, Entity *key) {
+	for (PolyBinding &b : s->items) {
+		if (b.key == key) {
+			return &b;
+		}
+	}
+	return nullptr;
+}
+gb_internal bool poly_subst_add(PolySubst *s, Entity *key, PolyBinding b) {
+	if (key == nullptr) {
+		return false;
+	}
+	PolyBinding *prev = poly_subst_find(s, key);
+	if (prev != nullptr) {
+		if (prev->kind != b.kind) {
+			return false;
+		}
+		switch (b.kind) {
+		case PolyBind_Type:      return are_types_identical(prev->type, b.type);
+		case PolyBind_Value:     return compare_exact_values(Token_CmpEq, prev->value, b.value);
+		case PolyBind_EnumArray: return are_types_identical(prev->type, b.type);
+		}
+		return false;
+	}
+	b.key = key;
+	array_add(&s->items, b);
+	return true;
+}
+gb_internal bool poly_subst_bind_type(PolySubst *s, Entity *key, Type *t) {
+	return poly_subst_add(s, key, PolyBinding{nullptr, PolyBind_Type, t, {}, nullptr});
+}
+gb_internal bool poly_subst_bind_value(PolySubst *s, Entity *key, ExactValue v, Type *value_type) {
+	return poly_subst_add(s, key, PolyBinding{nullptr, PolyBind_Value, nullptr, v, value_type});
+}
+gb_internal bool poly_subst_bind_enum_array(PolySubst *s, Entity *key, Type *ea) {
+	return poly_subst_add(s, key, PolyBinding{nullptr, PolyBind_EnumArray, ea, {}, nullptr});
+}
+// Integer payload of a PolyBind_Value used as a count (array/matrix/simd dimension).
+gb_internal i64 poly_binding_count(PolyBinding const *b) {
+	GB_ASSERT(b->kind == PolyBind_Value && b->value.kind == ExactValue_Integer);
+	return big_int_to_i64(&b->value.value_integer);
+}
+
+// True when `source` is an instantiation of the bare polymorphic record template `spec` (the form a
+// `$T/Stack` constraint takes), via its `polymorphic_parent` link.
+gb_internal bool subst_source_is_template_instance(Type *source, Type *spec) {
+	Type *sb = base_type(source);
+	if (sb->kind == Type_Struct) {
+		return sb->Struct.polymorphic_parent == spec;
+	}
+	if (sb->kind == Type_Union) {
+		return sb->Union.polymorphic_parent == spec;
+	}
+	return false;
+}
+
+gb_internal SubstResult subst_unify(CheckerContext *c, Type *pattern, Type *source, PolySubst *subst);
+
+// Match a constraint `spec` against `source` (does `$T/spec` accept `source`?), binding spec's nested
+// vars. Covers: a bare template, record conformance (via the Named types), an untyped source's default
+// type, or a base-typed structural match for everything else — so unlike a plain subst_unify it sees
+// through named/distinct types (e.g. `[dynamic]$E` vs a `distinct [dynamic]V`). Anything it cannot
+// cleanly resolve (subtyping, untyped conversions, cross-kind) is returned as Subst_Unhandled, which the
+// caller treats as a definite non-match.
+gb_internal SubstResult subst_unify_constraint(CheckerContext *c, Type *spec, Type *source, PolySubst *subst) {
+	if (source == nullptr || source == t_invalid) {
+		return Subst_Matched;
+	}
+	if (subst_source_is_template_instance(source, spec)) {
+		return Subst_Matched;
+	}
+	Type *sb = base_type(spec);
+	Type *tb = base_type(source);
+	SubstResult r;
+	if (is_type_untyped(tb)) {
+		r = subst_unify(c, spec, default_type(source), subst);
+	} else if (sb->kind == Type_Struct || sb->kind == Type_Union) {
+		if (tb == sb &&
+		    ((tb->kind == Type_Struct && tb->Struct.polymorphic_parent == nullptr) ||
+		     (tb->kind == Type_Union  && tb->Union.polymorphic_parent  == nullptr))) {
+			return Subst_Matched;
+		}
+		r = subst_unify(c, spec, source, subst); // record conformance keeps the Named types (match params)
+	} else {
+		r = subst_unify(c, sb, tb, subst);        // general: base-typed structural match
+	}
+	return r == Subst_Matched ? Subst_Matched : Subst_Unhandled;
+}
+
+gb_internal SubstResult subst_unify(CheckerContext *c, Type *pattern, Type *source, PolySubst *subst) {
+	if (pattern == nullptr || source == nullptr) {
+		return Subst_Unhandled;
+	}
+	switch (pattern->kind) {
+	case Type_Basic:
+		if (are_types_identical(pattern, source)){
+			return Subst_Matched;
+		}
+		return Subst_NoMatch;
+	case Type_Generic:
+		if (pattern->Generic.specialized != nullptr) {
+			// Constrained generic `$T/S`: match the constraint (binding its nested vars, e.g. `$U` in
+			// `$T/Stack($U)` or `$T`/`$E` in `$P/proc($T)->$E`), then bind T.
+			if (subst_unify_constraint(c, pattern->Generic.specialized, source, subst) != Subst_Matched) {
+				return Subst_Unhandled;
+			}
+		}
+		if (poly_subst_bind_type(subst, poly_generic_entity(pattern), default_type(source))){
+			return Subst_Matched;
+		}
+		return Subst_NoMatch;
+	case Type_Pointer: {
+		// A `^T` pattern also matches a `[^]T` source (the mutator allows ^<->[^] here). The subtype
+		// check mirrors the mutator: allow_polymorphic for a pointer source, plain for a multi-pointer.
+		Type *src_elem = nullptr;
+		bool allow_poly = false;
+		if (source->kind == Type_Pointer) {
+			src_elem = source->Pointer.elem;
+			allow_poly = true;
+		} else if (source->kind == Type_MultiPointer) {
+			src_elem = source->MultiPointer.elem;
+		} else {
+			return Subst_NoMatch;
+		}
+		if (base_type(pattern->Pointer.elem)->kind == Type_Struct &&
+		    check_is_assignable_to_using_subtype(src_elem, pattern->Pointer.elem, 0, false, allow_poly) > 0) {
+			// NOTE(bill): a subtype, e.g. `^Expr` for `$T/^Node`, which has nothing to bind unless the pattern is polymorphic
+			return is_type_polymorphic(pattern->Pointer.elem) ? Subst_Unhandled : Subst_Matched;
+		}
+		return subst_unify(c, pattern->Pointer.elem, src_elem, subst);
+	}
+	case Type_MultiPointer: {
+		Type *src_elem = nullptr;
+		if (source->kind == Type_MultiPointer) {
+			src_elem = source->MultiPointer.elem;
+		} else if (source->kind == Type_Pointer) {
+			src_elem = source->Pointer.elem;
+		} else {
+			return Subst_NoMatch;
+		}
+		if (base_type(pattern->MultiPointer.elem)->kind == Type_Struct &&
+		    check_is_assignable_to_using_subtype(src_elem, pattern->MultiPointer.elem) > 0) {
+			return is_type_polymorphic(pattern->MultiPointer.elem) ? Subst_Unhandled : Subst_Matched;
+		}
+		return subst_unify(c, pattern->MultiPointer.elem, src_elem, subst);
+	}
+	case Type_Slice:
+		if (source->kind != Type_Slice) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->Slice.elem, source->Slice.elem, subst);
+	case Type_DynamicArray:
+		if (source->kind != Type_DynamicArray) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->DynamicArray.elem, source->DynamicArray.elem, subst);
+	case Type_Map: {
+		if (source->kind != Type_Map) {
+			return Subst_NoMatch;
+		}
+		SubstResult k = subst_unify(c, pattern->Map.key, source->Map.key, subst);
+		if (k != Subst_Matched) {
+			return k;
+		}
+		return subst_unify(c, pattern->Map.value, source->Map.value, subst);
+	}
+	case Type_Array:
+		if (source->kind == Type_Array) {
+			if (pattern->Array.generic_count != nullptr) {
+				if (pattern->Array.generic_count->Generic.specialized != nullptr) {
+					return Subst_Unhandled;
+				}
+				Entity *ne = poly_generic_entity(pattern->Array.generic_count);
+				if (ne == nullptr) {
+					return Subst_Unhandled;
+				}
+				if (!poly_subst_bind_value(subst, ne, exact_value_i64(source->Array.count), t_untyped_integer)) {
+					return Subst_NoMatch;
+				}
+			} else if (pattern->Array.count != source->Array.count) {
+				return Subst_NoMatch;
+			}
+			return subst_unify(c, pattern->Array.elem, source->Array.elem, subst);
+		} else if (source->kind == Type_EnumeratedArray) {
+			if (pattern->Array.generic_count == nullptr) {
+				return Subst_NoMatch;
+			}
+			if (pattern->Array.generic_count->Generic.specialized != nullptr) {
+				return Subst_Unhandled;
+			}
+			Entity *ne = poly_generic_entity(pattern->Array.generic_count);
+			if (ne == nullptr) {
+				return Subst_Unhandled;
+			}
+			if (ne->kind != Entity_TypeName) { // old only takes the enum branch when $N is unbound
+				return Subst_NoMatch;
+			}
+			if (base_type(source->EnumeratedArray.index)->kind != Type_Enum) {
+				return Subst_NoMatch;
+			}
+			if (!poly_subst_bind_enum_array(subst, ne, source)) {
+				return Subst_NoMatch;
+			}
+			return subst_unify(c, pattern->Array.elem, source->EnumeratedArray.elem, subst);
+		}
+		return Subst_Unhandled;
+	case Type_Matrix: {
+		if (source->kind != Type_Matrix) {
+			return Subst_Unhandled;
+		}
+		if (pattern->Matrix.generic_row_count != nullptr) {
+			if (pattern->Matrix.generic_row_count->Generic.specialized != nullptr) {
+				return Subst_Unhandled;
+			}
+			Entity *re = poly_generic_entity(pattern->Matrix.generic_row_count);
+			if (re == nullptr) {
+				return Subst_Unhandled;
+			}
+			if (!poly_subst_bind_value(subst, re, exact_value_i64(source->Matrix.row_count), t_untyped_integer)) {
+				return Subst_NoMatch;
+			}
+		} else if (pattern->Matrix.row_count != source->Matrix.row_count) {
+			return Subst_NoMatch;
+		}
+		if (pattern->Matrix.generic_column_count != nullptr) {
+			if (pattern->Matrix.generic_column_count->Generic.specialized != nullptr) {
+				return Subst_Unhandled;
+			}
+			Entity *ce = poly_generic_entity(pattern->Matrix.generic_column_count);
+			if (ce == nullptr) {
+				return Subst_Unhandled;
+			}
+			if (!poly_subst_bind_value(subst, ce, exact_value_i64(source->Matrix.column_count), t_untyped_integer)) {
+				return Subst_NoMatch;
+			}
+		} else if (pattern->Matrix.column_count != source->Matrix.column_count) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->Matrix.elem, source->Matrix.elem, subst);
+	}
+	case Type_SimdVector:
+		if (source->kind != Type_SimdVector) {
+			return Subst_Unhandled;
+		}
+		if (pattern->SimdVector.generic_count != nullptr) {
+			if (pattern->SimdVector.generic_count->Generic.specialized != nullptr) {
+				return Subst_Unhandled;
+			}
+			Entity *ne = poly_generic_entity(pattern->SimdVector.generic_count);
+			if (ne == nullptr) {
+				return Subst_Unhandled;
+			}
+			if (!poly_subst_bind_value(subst, ne, exact_value_i64(source->SimdVector.count), t_untyped_integer)) {
+				return Subst_NoMatch;
+			}
+		} else if (pattern->SimdVector.count != source->SimdVector.count) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->SimdVector.elem, source->SimdVector.elem, subst);
+	case Type_Named: {
+		if (!is_type_polymorphic(pattern)) {
+			if (are_types_identical(pattern, source)) {
+				return Subst_Matched;
+			}
+			return Subst_NoMatch;
+		}
+		Type *pb = base_type(pattern);
+		Type *sb = base_type(source);
+		if (pb->kind != sb->kind) {
+			return Subst_Unhandled;
+		}
+		Type *s_parent = nullptr, *t_parent = nullptr;
+		TypeTuple *s_tuple = nullptr, *t_tuple = nullptr;
+		if (pb->kind == Type_Struct) {
+			s_parent = pb->Struct.polymorphic_parent;
+			t_parent = sb->Struct.polymorphic_parent;
+			s_tuple  = get_record_polymorphic_params(pb);
+			t_tuple  = get_record_polymorphic_params(sb);
+		} else if (pb->kind == Type_Union) {
+			s_parent = pb->Union.polymorphic_parent;
+			t_parent = sb->Union.polymorphic_parent;
+			s_tuple  = get_record_polymorphic_params(pb);
+			t_tuple  = get_record_polymorphic_params(sb);
+		} else {
+			return Subst_Unhandled;
+		}
+		if (s_parent == nullptr || s_parent != t_parent || s_tuple == nullptr || t_tuple == nullptr) {
+			return Subst_Unhandled;
+		}
+		if (s_tuple->variables.count != t_tuple->variables.count) {
+			return Subst_NoMatch;
+		}
+		for_array(i, s_tuple->variables) {
+			Entity *s_e = s_tuple->variables[i];
+			Entity *t_e = t_tuple->variables[i];
+			Type *st = s_e->type;
+			if (st->kind == Type_Generic) {
+				Entity *ge = poly_generic_entity(st);
+				if (ge == nullptr) {
+					return Subst_Unhandled;
+				}
+				if (st->Generic.specialized != nullptr) {
+					// Constrained record param `$T/S`: bind the nested vars of the constraint, then T.
+					Type *spec = st->Generic.specialized;
+					if (!subst_source_is_template_instance(t_e->type, spec)) {
+						SubstResult r = subst_unify(c, spec, t_e->type, subst);
+						if (r != Subst_Matched) {
+							return Subst_Unhandled;
+						}
+					}
+					if (!poly_subst_bind_type(subst, ge, default_type(t_e->type))) {
+						return Subst_NoMatch;
+					}
+				} else if (t_e->kind == Entity_Constant) {
+					// A record's polymorphic constant parameter, of any type (int, string, bool, ...).
+					if (!poly_subst_bind_value(subst, ge, t_e->Constant.value, t_e->type)) {
+						return Subst_NoMatch;
+					}
+				} else {
+					if (!poly_subst_bind_type(subst, ge, default_type(t_e->type))) {
+						return Subst_NoMatch;
+					}
+				}
+			} else {
+				SubstResult r = subst_unify(c, st, t_e->type, subst);
+				if (r != Subst_Matched) {
+					return r; // NoMatch or Unhandled
+				}
+				// e.g. `M(1, 1, $T)` vs `M(3, 3, f64)`
+				if (s_e->kind == Entity_Constant && t_e->kind == Entity_Constant &&
+				    !compare_exact_values(Token_CmpEq, s_e->Constant.value, t_e->Constant.value)) {
+					return Subst_NoMatch;
+				}
+			}
+		}
+		return Subst_Matched;
+	}
+	case Type_Proc: {
+		if (source->kind != Type_Proc) {
+			return Subst_NoMatch;
+		}
+		if (pattern->Proc.calling_convention != source->Proc.calling_convention ||
+		    pattern->Proc.c_vararg           != source->Proc.c_vararg ||
+		    pattern->Proc.variadic           != source->Proc.variadic ||
+		    pattern->Proc.param_count        != source->Proc.param_count ||
+		    pattern->Proc.result_count       != source->Proc.result_count) {
+			return Subst_NoMatch;
+		}
+		for (i32 i = 0; i < pattern->Proc.param_count; i++) {
+			SubstResult r = subst_unify(c, pattern->Proc.params->Tuple.variables[i]->type,
+			                               source->Proc.params->Tuple.variables[i]->type, subst);
+			if (r != Subst_Matched) {
+				return Subst_Unhandled; // param context allows assignability, defer to the mutator
+			}
+		}
+		for (i32 i = 0; i < pattern->Proc.result_count; i++) {
+			SubstResult r = subst_unify(c, pattern->Proc.results->Tuple.variables[i]->type,
+			                               source->Proc.results->Tuple.variables[i]->type, subst);
+			if (r != Subst_Matched) {
+				return Subst_Unhandled;
+			}
+		}
+		return Subst_Matched;
+	}
+	case Type_Union: {
+		if (source->kind != Type_Union) {
+			return Subst_NoMatch;
+		}
+		if (pattern->Union.variants.count != source->Union.variants.count) {
+			return Subst_NoMatch;
+		}
+		for_array(i, pattern->Union.variants) {
+			SubstResult r = subst_unify(c, pattern->Union.variants[i], source->Union.variants[i], subst);
+			if (r != Subst_Matched) {
+				return Subst_Unhandled; // variant context allows assignability, defer to the mutator
+			}
+		}
+		return Subst_Matched;
+	}
+	case Type_SoaPointer:
+		if (source->kind != Type_SoaPointer) {
+			return Subst_Unhandled;
+		}
+		if (base_type(pattern->SoaPointer.elem)->kind == Type_Struct &&
+		    check_is_assignable_to_using_subtype(source->SoaPointer.elem, pattern->SoaPointer.elem, 0, false, true) > 0) {
+			return is_type_polymorphic(pattern->SoaPointer.elem) ? Subst_Unhandled : Subst_Matched;
+		}
+		return subst_unify(c, pattern->SoaPointer.elem, source->SoaPointer.elem, subst);
+	case Type_FixedCapacityDynamicArray:
+		if (source->kind != Type_FixedCapacityDynamicArray) {
+			return Subst_NoMatch;
+		}
+		if (pattern->FixedCapacityDynamicArray.generic_capacity != nullptr) {
+			if (pattern->FixedCapacityDynamicArray.generic_capacity->Generic.specialized != nullptr) {
+				return Subst_Unhandled;
+			}
+			Entity *ne = poly_generic_entity(pattern->FixedCapacityDynamicArray.generic_capacity);
+			if (ne == nullptr) {
+				return Subst_Unhandled;
+			}
+			if (!poly_subst_bind_value(subst, ne, exact_value_i64(source->FixedCapacityDynamicArray.capacity), t_untyped_integer)) {
+				return Subst_NoMatch;
+			}
+		} else if (pattern->FixedCapacityDynamicArray.capacity != source->FixedCapacityDynamicArray.capacity) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->FixedCapacityDynamicArray.elem, source->FixedCapacityDynamicArray.elem, subst);
+	case Type_EnumeratedArray: {
+		if (source->kind != Type_EnumeratedArray) {
+			return Subst_NoMatch;
+		}
+		if (pattern->EnumeratedArray.op || source->EnumeratedArray.op) {
+			return Subst_Unhandled; // range (`op`) form: currently never constructed; defer if it ever is
+		}
+		// `#sparse` arrays flow through here and are handled; is_sparse is carried in subst_apply.
+		SubstResult ir = subst_unify(c, pattern->EnumeratedArray.index, source->EnumeratedArray.index, subst);
+		if (ir != Subst_Matched) {
+			return ir;
+		}
+		return subst_unify(c, pattern->EnumeratedArray.elem, source->EnumeratedArray.elem, subst);
+	}
+	case Type_BitSet: {
+		if (source->kind != Type_BitSet) {
+			return Subst_NoMatch;
+		}
+		if (!is_type_polymorphic(pattern->BitSet.elem)) {
+			if (pattern->BitSet.upper != source->BitSet.upper ||
+			    pattern->BitSet.lower != source->BitSet.lower) {
+				return Subst_NoMatch;
+			}
+		}
+		SubstResult er = subst_unify(c, pattern->BitSet.elem, source->BitSet.elem, subst);
+		if (er != Subst_Matched) {
+			return er;
+		}
+		if (pattern->BitSet.underlying != nullptr) {
+			if (source->BitSet.underlying == nullptr) {
+				return Subst_NoMatch;
+			}
+			SubstResult ur = subst_unify(c, pattern->BitSet.underlying, source->BitSet.underlying, subst);
+			if (ur != Subst_Matched) {
+				return ur;
+			}
+		}
+		return Subst_Matched;
+	}
+	case Type_BitField:
+		if (source->kind != Type_BitField) {
+			return Subst_NoMatch;
+		}
+		return subst_unify(c, pattern->BitField.backing_type, source->BitField.backing_type, subst);
+	case Type_Struct: {
+		if (source->kind != Type_Struct) {
+			return Subst_NoMatch;
+		}
+		if (pattern->Struct.soa_kind != StructSoa_None || source->Struct.soa_kind != StructSoa_None) {
+			if (pattern->Struct.soa_kind != source->Struct.soa_kind) {
+				return Subst_NoMatch;
+			}
+			return subst_unify(c, pattern->Struct.soa_elem, source->Struct.soa_elem, subst);
+		}
+		// Anonymous struct with field-level polymorphism (e.g. `struct{x: $T, y: [2]T}`): match fields
+		// positionally. Record subtyping is not attempted here, so it is left to the mutator.
+		if (pattern->Struct.is_raw_union != source->Struct.is_raw_union ||
+		    pattern->Struct.is_packed != source->Struct.is_packed) {
+			return Subst_Unhandled;
+		}
+		wait_for_record_signal(&pattern->Struct.fields_wait_signal, &pattern->Struct.checking_thread);
+		wait_for_record_signal(&source->Struct.fields_wait_signal, &source->Struct.checking_thread);
+		if (pattern->Struct.fields.count != source->Struct.fields.count) {
+			return Subst_NoMatch;
+		}
+		for_array(i, pattern->Struct.fields) {
+			Entity *pf = pattern->Struct.fields[i];
+			Entity *sf = source->Struct.fields[i];
+			if (pf->token.string != sf->token.string) {
+				return Subst_NoMatch;
+			}
+			if ((pf->flags & EntityFlags_IsSubtype) != (sf->flags & EntityFlags_IsSubtype)) {
+				return Subst_NoMatch; // a `using`/subtype field must match one on the source
+			}
+			SubstResult r = subst_unify(c, pf->type, sf->type, subst);
+			if (r != Subst_Matched) {
+				return Subst_Unhandled; // field context allows assignability/subtyping, defer to the mutator
+			}
+		}
+		return Subst_Matched;
+	}
+	}
+	return Subst_Unhandled;
+}
+
+// Substitution-keyed instantiation lookup: find the already-generated record instantiation whose
+// concrete parameters match `pattern`'s parameters under `subst`. Unlike find_polymorphic_record_entity
+// this compares types/values directly (no call-site exprs), so it can be driven by a substitution.
+// Caller holds the record's gen_types mutex.
+gb_internal Entity *find_polymorphic_record_by_subst(GenTypesData *gt, TypeTuple *p_tuple, PolySubst *subst) {
+	for (Entity *e : gt->types) {
+		Type *eb = base_type(e->type);
+		TypeTuple *e_tuple = get_record_polymorphic_params(eb);
+		if (e_tuple == nullptr || e_tuple->variables.count != p_tuple->variables.count) {
+			continue;
+		}
+		bool match = true;
+		for_array(i, p_tuple->variables) {
+			Entity *pp = p_tuple->variables[i];
+			Entity *ep = e_tuple->variables[i];
+			Type *pt = pp->type;
+			if (pt != nullptr && pt->kind == Type_Generic) {
+				PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pt));
+				if (b == nullptr) {
+					match = false;
+					break;
+				}
+				if (b->kind == PolyBind_Value) {
+					if (ep->kind != Entity_Constant ||
+					    !compare_exact_values(Token_CmpEq, ep->Constant.value, b->value)) {
+						match = false;
+						break;
+					}
+				} else if (b->kind == PolyBind_Type) {
+					if (ep->kind != Entity_TypeName || !are_types_identical(ep->type, b->type)) {
+						match = false;
+						break;
+					}
+				} else {
+					match = false;
+					break;
+				}
+			} else if (pp->kind == Entity_Constant && ep->kind == Entity_Constant) {
+				if (!compare_exact_values(Token_CmpEq, pp->Constant.value, ep->Constant.value)) {
+					match = false;
+					break;
+				}
+			} else if (pp->kind == Entity_TypeName && ep->kind == Entity_TypeName) {
+				if (!are_types_identical(pp->type, ep->type)) {
+					match = false;
+					break;
+				}
+			} else {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
+			return e;
+		}
+	}
+	return nullptr;
+}
+
+gb_internal Type *subst_apply(CheckerContext *c, Type *pattern, Type *source, PolySubst *subst);
+
+gb_internal Type *subst_apply_tuple(CheckerContext *c, Type *pattern_tuple, Type *source_tuple, PolySubst *subst) {
+	Type *t = alloc_type_tuple();
+	isize n = pattern_tuple->Tuple.variables.count;
+	auto vars = slice_make<Entity *>(permanent_allocator(), n);
+	for (isize i = 0; i < n; i++) {
+		Entity *pe = pattern_tuple->Tuple.variables[i];
+		Entity *se = source_tuple->Tuple.variables[i];
+		Type *nt = subst_apply(c, pe->type, se->type, subst);
+		Entity *ne;
+		switch (pe->kind) {
+		case Entity_Constant: ne = alloc_entity_constant(pe->scope, pe->token, nt, pe->Constant.value); break;
+		case Entity_TypeName: ne = alloc_entity_type_name(pe->scope, pe->token, nt, EntityState_Resolved); break;
+		default:              ne = alloc_entity_variable(pe->scope, pe->token, nt, EntityState_Resolved); break;
+		}
+		ne->flags = pe->flags.load();
+		vars[i] = ne;
+	}
+	t->Tuple.variables = vars;
+	t->Tuple.is_packed = pattern_tuple->Tuple.is_packed;
+	return t;
+}
+
+gb_internal Type *subst_apply(CheckerContext *c, Type *pattern, Type *source, PolySubst *subst) {
+	switch (pattern->kind) {
+	case Type_Basic:
+		return pattern;
+	case Type_Generic: {
+		PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern));
+		GB_ASSERT(b != nullptr && b->kind == PolyBind_Type);
+		return b->type;
+	}
+	case Type_Pointer: {
+		// result keeps the pattern's pointer kind; source may be `^` or `[^]`
+		Type *src_elem = (source->kind == Type_MultiPointer) ? source->MultiPointer.elem : source->Pointer.elem;
+		return alloc_type_pointer(subst_apply(c, pattern->Pointer.elem, src_elem, subst));
+	}
+	case Type_MultiPointer: {
+		Type *src_elem = (source->kind == Type_Pointer) ? source->Pointer.elem : source->MultiPointer.elem;
+		return alloc_type_multi_pointer(subst_apply(c, pattern->MultiPointer.elem, src_elem, subst));
+	}
+	case Type_SoaPointer:
+		return alloc_type_soa_pointer(subst_apply(c, pattern->SoaPointer.elem, source->SoaPointer.elem, subst));
+	case Type_Slice:
+		return alloc_type_slice(subst_apply(c, pattern->Slice.elem, source->Slice.elem, subst));
+	case Type_DynamicArray:
+		return alloc_type_dynamic_array(subst_apply(c, pattern->DynamicArray.elem, source->DynamicArray.elem, subst));
+	case Type_FixedCapacityDynamicArray: {
+		Type *elem = subst_apply(c, pattern->FixedCapacityDynamicArray.elem, source->FixedCapacityDynamicArray.elem, subst);
+		i64 cap = pattern->FixedCapacityDynamicArray.capacity;
+		if (pattern->FixedCapacityDynamicArray.generic_capacity != nullptr) {
+			PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern->FixedCapacityDynamicArray.generic_capacity));
+			GB_ASSERT(b != nullptr && b->kind == PolyBind_Value);
+			cap = poly_binding_count(b);
+		}
+		return alloc_type_fixed_capacity_dynamic_array(elem, cap, nullptr);
+	}
+	case Type_Map: {
+		Type *m = alloc_type(Type_Map);
+		m->Map.key   = subst_apply(c, pattern->Map.key,   source->Map.key,   subst);
+		m->Map.value = subst_apply(c, pattern->Map.value, source->Map.value, subst);
+		init_map_internal_types(m); // the mutator does this; without it codegen hits a t_invalid
+		return m;
+	}
+	case Type_Array: {
+		if (pattern->Array.generic_count != nullptr) {
+			PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern->Array.generic_count));
+			GB_ASSERT(b != nullptr);
+			if (b->kind == PolyBind_EnumArray) {
+				Type *ea = b->type; // source EnumeratedArray captured at unify
+				Type *elem = subst_apply(c, pattern->Array.elem, ea->EnumeratedArray.elem, subst);
+				Type *r = alloc_type_enumerated_array(elem, ea->EnumeratedArray.index,
+					ea->EnumeratedArray.min_value, ea->EnumeratedArray.max_value,
+					ea->EnumeratedArray.count, ea->EnumeratedArray.op);
+				r->flags.exchange(ea->flags);
+				return r;
+			}
+			GB_ASSERT(b->kind == PolyBind_Value);
+			return alloc_type_array(subst_apply(c, pattern->Array.elem, source->Array.elem, subst), poly_binding_count(b), nullptr);
+		}
+		return alloc_type_array(subst_apply(c, pattern->Array.elem, source->Array.elem, subst), pattern->Array.count, nullptr);
+	}
+	case Type_EnumeratedArray: {
+		Type *elem  = subst_apply(c, pattern->EnumeratedArray.elem,  source->EnumeratedArray.elem,  subst);
+		Type *index = subst_apply(c, pattern->EnumeratedArray.index, source->EnumeratedArray.index, subst);
+		Type *r = alloc_type_enumerated_array(elem, index,
+			pattern->EnumeratedArray.min_value, pattern->EnumeratedArray.max_value,
+			pattern->EnumeratedArray.count, pattern->EnumeratedArray.op);
+		r->EnumeratedArray.is_sparse = pattern->EnumeratedArray.is_sparse; // alloc defaults this to false
+		return r;
+	}
+	case Type_Matrix: {
+		Type *elem = subst_apply(c, pattern->Matrix.elem, source->Matrix.elem, subst);
+		i64 rc = pattern->Matrix.row_count;
+		i64 cc = pattern->Matrix.column_count;
+		if (pattern->Matrix.generic_row_count != nullptr) {
+			PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern->Matrix.generic_row_count));
+			GB_ASSERT(b != nullptr && b->kind == PolyBind_Value);
+			rc = poly_binding_count(b);
+		}
+		if (pattern->Matrix.generic_column_count != nullptr) {
+			PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern->Matrix.generic_column_count));
+			GB_ASSERT(b != nullptr && b->kind == PolyBind_Value);
+			cc = poly_binding_count(b);
+		}
+		return alloc_type_matrix(elem, rc, cc, nullptr, nullptr, pattern->Matrix.is_row_major);
+	}
+	case Type_SimdVector: {
+		Type *elem = subst_apply(c, pattern->SimdVector.elem, source->SimdVector.elem, subst);
+		i64 count = pattern->SimdVector.count;
+		if (pattern->SimdVector.generic_count != nullptr) {
+			PolyBinding *b = poly_subst_find(subst, poly_generic_entity(pattern->SimdVector.generic_count));
+			GB_ASSERT(b != nullptr && b->kind == PolyBind_Value);
+			count = poly_binding_count(b);
+		}
+		return alloc_type_simd_vector(count, elem, nullptr);
+	}
+	case Type_Proc: {
+		// Reproduce the mutator: keep the pattern's proc properties, substitute param/result types.
+		Type *r = alloc_type(Type_Proc);
+		r->Proc = pattern->Proc;
+		r->Proc.params  = pattern->Proc.params  ? subst_apply_tuple(c, pattern->Proc.params,  source->Proc.params,  subst) : nullptr;
+		r->Proc.results = pattern->Proc.results ? subst_apply_tuple(c, pattern->Proc.results, source->Proc.results, subst) : nullptr;
+		r->Proc.is_polymorphic = false;
+		r->Proc.is_poly_specialized = false;
+		return r;
+	}
+	case Type_Union: {
+		Type *r = alloc_type(Type_Union);
+		r->Union.node         = pattern->Union.node;
+		r->Union.scope        = pattern->Union.scope;
+		r->Union.custom_align = pattern->Union.custom_align;
+		r->Union.kind         = pattern->Union.kind;
+		r->Union.variant_block_size.store(pattern->Union.variant_block_size.load());
+		r->Union.tag_size.store(pattern->Union.tag_size.load());
+		isize n = pattern->Union.variants.count;
+		auto vars = slice_make<Type *>(permanent_allocator(), n);
+		for (isize i = 0; i < n; i++) {
+			vars[i] = subst_apply(c, pattern->Union.variants[i], source->Union.variants[i], subst);
+		}
+		r->Union.variants = vars;
+		wait_signal_set(&r->Union.variants_wait_signal);
+		wait_signal_set(&r->Union.polymorphic_wait_signal);
+		return r;
+	}
+	case Type_BitSet:
+		// bit_set has source-derived bounds/underlying; unify has verified the structural match, so the
+		// resolved type is the (already concrete) source.
+		return source;
+	case Type_BitField: {
+		Type *backing = subst_apply(c, pattern->BitField.backing_type, source->BitField.backing_type, subst);
+		Type *r = alloc_type_bit_field();
+		r->BitField.backing_type = backing;
+		r->BitField.fields       = pattern->BitField.fields;
+		r->BitField.tags         = pattern->BitField.tags;
+		r->BitField.bit_sizes    = pattern->BitField.bit_sizes;
+		r->BitField.bit_offsets  = pattern->BitField.bit_offsets;
+		r->BitField.scope        = pattern->BitField.scope;
+		r->BitField.node         = pattern->BitField.node;
+		// The backing-size check is deferred from check_bit_field_type for a polymorphic backing; run it
+		// now that the backing is concrete.
+		if (!c->no_polymorphic_errors && !c->hide_polymorphic_errors && !is_type_polymorphic(backing)) {
+			u64 total = 0;
+			for (u8 bs : r->BitField.bit_sizes) {
+				total += bs;
+			}
+			u64 maximum = 8 * cast(u64)type_size_of(backing);
+			if (total > maximum) {
+				gbString s = type_to_string(backing);
+				error(pattern->BitField.node, "The total bit size of a bit_field's fields (%llu) must fit into its backing type's (%s) bit size of %llu",
+				      cast(unsigned long long)total, s, cast(unsigned long long)maximum);
+				gb_string_free(s);
+			}
+		}
+		return r;
+	}
+	case Type_Struct: {
+		if (pattern->Struct.soa_kind == StructSoa_None) {
+			// Anonymous field-polymorphic struct: unify matched fields positionally, so the resolved
+			// type is the (already concrete) source.
+			return source;
+		}
+		Type *elem = subst_apply(c, pattern->Struct.soa_elem, source->Struct.soa_elem, subst);
+		switch (pattern->Struct.soa_kind) {
+		case StructSoa_Fixed:   return make_soa_struct_fixed(c, nullptr, pattern->Struct.node, elem, pattern->Struct.soa_count, nullptr);
+		case StructSoa_Slice:   return make_soa_struct_slice(c, nullptr, pattern->Struct.node, elem);
+		case StructSoa_Dynamic: return make_soa_struct_dynamic_array(c, nullptr, pattern->Struct.node, elem);
+		}
+		GB_PANIC("subst_apply: unhandled soa struct kind");
+		return nullptr;
+	}
+	case Type_Named: {
+		if (!is_type_polymorphic(pattern)) {
+			return pattern;
+		}
+		Type *pb = base_type(pattern);
+		Type *orig = nullptr;
+		TypeTuple *p_tuple = get_record_polymorphic_params(pb);
+		if (pb->kind == Type_Struct) {
+			orig = pb->Struct.polymorphic_parent;
+		} else if (pb->kind == Type_Union) {
+			orig = pb->Union.polymorphic_parent;
+		}
+		GB_ASSERT(orig != nullptr && p_tuple != nullptr);
+
+		// If the source is already a concrete instantiation of this same record, use it directly. This
+		// is both faster and handles records whose polymorphic argument is itself a compound type (e.g.
+		// `Pair([2]$T)` or `Pair([E]$T)`), which the substitution-based lookup below cannot reconstruct
+		// (its parameter is an array, not a bare `$T`).
+		if (source != nullptr && !is_type_polymorphic(source)) {
+			Type *sb = base_type(source);
+			Type *sorig = (sb->kind == Type_Struct) ? sb->Struct.polymorphic_parent
+			            : (sb->kind == Type_Union)  ? sb->Union.polymorphic_parent
+			            :                             nullptr;
+			if (sorig != nullptr && sorig == orig) {
+				return source;
+			}
+		}
+
+		GenTypesData *gt = ensure_polymorphic_record_entity_has_gen_types(c, orig);
+		mutex_lock(&gt->mutex);
+		Entity *found = find_polymorphic_record_by_subst(gt, p_tuple, subst);
+		mutex_unlock(&gt->mutex);
+		GB_ASSERT_MSG(found != nullptr, "subst_apply: no instantiation found for '%s'", type_to_string(pattern));
+		return found->type;
+	}
+	}
+	GB_PANIC("subst_apply: unhandled kind");
+	return nullptr;
+}
+
+// Bind each poly-scope entity to its substitution value, replacing the side effects the in-place
+// mutation used to perform (polymorphic_assign_index's entity flip, the $T node rewrite, the
+// enum-array alias). Used when the substitution is authoritative for a pattern.
+gb_internal void subst_bind_entities(PolySubst *subst) {
+	for (PolyBinding &b : subst->items) {
+		Entity *e = b.key;
+		switch (b.kind) {
+		case PolyBind_Type:
+			e->type = b.type;
+			break;
+		case PolyBind_Value:
+			e->kind = Entity_Constant;
+			e->Constant.value = b.value;
+			e->type = b.value_type;
+			break;
+		case PolyBind_EnumArray:
+			e->kind = Entity_TypeName;
+			e->TypeName.is_type_alias = true;
+			e->type = b.type->EnumeratedArray.index;
+			break;
+		}
+	}
+}
+
+// Specialization-conformance check for a `$T: Constraint` record/proc parameter: does `type` conform
+// to `specialization`, binding the constraint's nested vars when modify_type? Handled entirely by the
+// substitution engine (subst_unify_constraint). A non-match is a definite non-conformance; if the engine
+// is ever incomplete for some constraint the result is a loud "does not satisfy constraint" error at the
+// call site, never a silent miscompile.
+gb_internal bool subst_check_specialization(CheckerContext *ctx, Type *specialization, Type *type, bool modify_type) {
+	if (type == nullptr || type == t_invalid) {
+		return true;
+	}
+	PolySubst sub = {};
+	sub.items.allocator = heap_allocator();
+	defer (array_free(&sub.items));
+	if (subst_unify_constraint(ctx, specialization, type, &sub) == Subst_Matched) {
+		if (modify_type) {
+			subst_bind_entities(&sub);
+		}
+		return true;
+	}
+	return false;
+}
+
+// Match `source` against the polymorphic `pattern` with the substitution engine. When they unify and
+// `modify_type` is set, bind the captured poly-scope entities (the side effect the old in-place matcher
+// produced); returns whether they unified. This is the subst-based replacement for the overload-scoring
+// use of is_polymorphic_type_assignable. Exposed as a plain bool for earlier unity-build translation units.
+gb_internal bool subst_poly_assignable(CheckerContext *c, Type *pattern, Type *source, bool modify_type) {
+	PolySubst subst = {};
+	subst.items.allocator = heap_allocator();
+	defer (array_free(&subst.items));
+	if (subst_unify(c, pattern, source, &subst) == Subst_Matched) {
+		if (modify_type) {
+			subst_bind_entities(&subst);
+		}
+		return true;
+	}
+	return false;
+}
+
+gb_internal bool ast_is_context_free_constant(Ast *e) {
+	if (e == nullptr) {
+		return false;
+	}
+	e = unparen_expr(e);
+	if (e == nullptr) {
+		return false;
+	}
+	switch (e->kind) {
+	case Ast_BasicLit:
+		return true;
+	case Ast_UnaryExpr:
+		return ast_is_context_free_constant(e->UnaryExpr.expr);
+	case Ast_BinaryExpr:
+		return ast_is_context_free_constant(e->BinaryExpr.left) &&
+		       ast_is_context_free_constant(e->BinaryExpr.right);
+	}
+	return false;
+}
+
+gb_internal Type *context_free_constant_type(CheckerContext *ctx, Ast *e) {
+	if (!ast_is_context_free_constant(e)) {
+		return nullptr;
+	}
+	Operand o = {};
+	Ast *trial = clone_ast(e);
+	i64 muted_before = error_mute_count();
+	begin_error_mute();
+	check_expr(ctx, &o, trial);
+	end_error_mute();
+	if (o.mode == Addressing_Invalid || o.type == nullptr || o.type == t_invalid ||
+	    error_mute_count() != muted_before) {
+		return nullptr;
+	}
+	Type *t = default_type(o.type);
+	if (t == nullptr || t == t_invalid || is_type_polymorphic(t)) {
+		return nullptr;
+	}
+	return t;
+}
+
+gb_internal Type *poly_array_source_from_compound_lit(CheckerContext *ctx, Type *poly_type, Ast *expr) {
+	if (expr == nullptr) {
+		return nullptr;
+	}
+	expr = unparen_expr(expr);
+	if (expr == nullptr || expr->kind != Ast_CompoundLit || expr->CompoundLit.type != nullptr) {
+		return nullptr;
+	}
+
+	Type *bt = base_type(poly_type);
+	Type *elem_pattern = nullptr;
+	bool generic_count = false;
+	switch (bt->kind) {
+	case Type_Array:
+		if (bt->Array.generic_count != nullptr) {
+			if (bt->Array.generic_count->Generic.specialized != nullptr) {
+				return nullptr; // a constrained count `$N/...` is out of scope
+			}
+			generic_count = true; // `[$N]...` binds N to the literal's element count
+		}
+		elem_pattern = bt->Array.elem;
+		break;
+	case Type_Slice:        elem_pattern = bt->Slice.elem;        break;
+	case Type_DynamicArray: elem_pattern = bt->DynamicArray.elem; break;
+	default:
+		return nullptr;
+	}
+
+	// A polymorphic element must be a bare `$T` (unambiguous element determination); otherwise the only
+	// thing left to determine is a polymorphic count.
+	bool elem_is_poly = is_type_polymorphic(elem_pattern);
+	if (elem_is_poly) {
+		if (elem_pattern->kind != Type_Generic || elem_pattern->Generic.specialized != nullptr) {
+			return nullptr;
+		}
+	} else if (!generic_count) {
+		return nullptr;
+	}
+
+	Slice<Ast *> const &elems = expr->CompoundLit.elems;
+	if (elems.count == 0) {
+		return nullptr; // `{}` determines neither an element type nor a meaningful count
+	}
+
+	Type *elem_type = elem_is_poly ? nullptr : elem_pattern;
+	if (elem_is_poly) {
+		// Determine the element type from the (homogeneous, context-free) elements.
+		for (Ast *e : elems) {
+			Type *et = context_free_constant_type(ctx, e);
+			if (et == nullptr) {
+				return nullptr;
+			}
+			if (elem_type == nullptr) {
+				elem_type = et;
+			} else if (!are_types_identical(elem_type, et)) {
+				return nullptr; // non-homogeneous: fall back to the explicit-type error
+			}
+		}
+		if (elem_type == nullptr) {
+			return nullptr;
+		}
+	} else {
+		// NOTE(bill): Count-only (`[$N]ConcreteElem`): the element content is validated later by materialize
+		for (Ast *e : elems) {
+			Ast *ue = unparen_expr(e);
+			if (ue != nullptr && ue->kind == Ast_FieldValue) {
+				return nullptr;
+			}
+		}
+	}
+
+	Type *source = nullptr;
+	switch (bt->kind) {
+	case Type_Array: {
+		i64 count = generic_count ? cast(i64)elems.count : bt->Array.count;
+		source = alloc_type_array(elem_type, count, nullptr);
+		break;
+	}
+	case Type_Slice:        source = alloc_type_slice(elem_type);         break;
+	case Type_DynamicArray: source = alloc_type_dynamic_array(elem_type); break;
+	}
+	return source;
+}
+
+gb_internal Type *poly_record_source_from_compound_lit(CheckerContext *ctx, Type *poly_type, Ast *expr) {
+	expr = unparen_expr(expr);
+	if (expr == nullptr || expr->kind != Ast_CompoundLit || expr->CompoundLit.type != nullptr) {
+		return nullptr;
+	}
+	Type *bt = base_type(poly_type);
+	if (bt->kind != Type_Struct || bt->Struct.polymorphic_parent == nullptr) {
+		return nullptr;
+	}
+	Type *original_type = bt->Struct.polymorphic_parent;
+	Type *ob = base_type(original_type);
+	TypeTuple *params = get_record_polymorphic_params(bt);
+	if (params == nullptr || ob->kind != Type_Struct || ob->Struct.node == nullptr) {
+		return nullptr;
+	}
+	Slice<Ast *> const &elems = expr->CompoundLit.elems;
+	if (elems.count == 0) {
+		return nullptr;
+	}
+	ast_node(st, StructType, ob->Struct.node);
+
+	Type **bound = temporary_alloc_array<Type *>(params->variables.count);
+	isize position = 0;
+	for (Ast *field : st->fields) {
+		if (field->kind != Ast_Field) {
+			continue;
+		}
+		ast_node(f, Field, field);
+		Ast *field_type = unparen_expr(f->type);
+		for (Ast *name : f->names) {
+			Ast *value = nullptr;
+			for (isize i = 0; i < elems.count; i++) {
+				Ast *elem = elems[i];
+				if (elem->kind == Ast_FieldValue) {
+					Ast *key = elem->FieldValue.field;
+					if (key->kind == Ast_Ident &&
+					    name->kind == Ast_Ident &&
+					    key->Ident.token.string == name->Ident.token.string) {
+						value = elem->FieldValue.value;
+					}
+				} else if (i == position) {
+					value = elem;
+				}
+			}
+			position += 1;
+
+			if (value == nullptr || field_type == nullptr || field_type->kind != Ast_Ident) {
+				continue;
+			}
+			isize param_index = -1;
+			for_array(j, params->variables) {
+				Entity *p = params->variables[j];
+				if (p->kind == Entity_TypeName && p->token.string == field_type->Ident.token.string) {
+					param_index = j;
+				}
+			}
+			if (param_index < 0) {
+				continue;
+			}
+			Type *t = context_free_constant_type(ctx, value);
+			if (t == nullptr) {
+				return nullptr;
+			}
+			if (bound[param_index] == nullptr) {
+				bound[param_index] = t;
+			} else if (!are_types_identical(bound[param_index], t)) {
+				return nullptr;
+			}
+		}
+	}
+
+	auto operands = array_make<Operand>(permanent_allocator(), params->variables.count);
+	for_array(j, params->variables) {
+		Entity *p = params->variables[j];
+		Operand o = {};
+		o.expr = expr;
+		if (p->kind == Entity_TypeName) {
+			o.mode = Addressing_Type;
+			o.type = p->type;
+			if (is_type_polymorphic(p->type)) {
+				if (p->type->kind != Type_Generic || bound[j] == nullptr) {
+					return nullptr;
+				}
+				o.type = bound[j];
+			}
+		} else if (p->kind == Entity_Constant && !is_type_polymorphic(p->type)) {
+			o.mode = Addressing_Constant;
+			o.type = p->type;
+			o.value = p->Constant.value;
+		} else {
+			return nullptr;
+		}
+		operands[j] = o;
+	}
+
+	return instantiate_polymorphic_record(ctx, original_type, operands, expr);
+}
+
+gb_internal Type *determine_type_from_polymorphic(CheckerContext *ctx, Type *poly_type, Operand const &operand) {
+	bool modify_type = !ctx->no_polymorphic_errors;
+	bool show_error = modify_type && !ctx->hide_polymorphic_errors;
+	if (!is_operand_value(operand)) {
+		if (operand.deferred_untyped_arg && modify_type) {
+			Type *source = poly_array_source_from_compound_lit(ctx, poly_type, operand.expr);
+			if (source == nullptr) {
+				source = poly_record_source_from_compound_lit(ctx, poly_type, operand.expr);
+			}
+			if (source != nullptr) {
+				PolySubst subst = {};
+				subst.items.allocator = heap_allocator();
+				defer (array_free(&subst.items));
+				if (subst_unify(ctx, poly_type, source, &subst) == Subst_Matched) {
+					Type *applied = subst_apply(ctx, poly_type, source, &subst);
+					subst_bind_entities(&subst);
+					return applied;
+				}
+			}
+		}
+		if (operand.deferred_untyped_arg && !modify_type) {
+			// Probe pass (procedure-group candidate pre-check): a deferred untyped argument carries no
+			// type yet, so it cannot constrain this parameter. Treat it as a match and let the real
+			// binding pass resolve the parameter from the other arguments. If the parameter is left
+			// polymorphic there (nothing else determines it), that pass fails, as it should.
+			return poly_type;
+		}
+		if (show_error) {
+			ERROR_BLOCK();
+
+			gbString pts = type_to_string(poly_type);
+			defer (gb_string_free(pts));
+			if (operand.deferred_untyped_arg) {
+				// An untyped argument (`{...}`, `.Member`, a both-untyped ternary) whose type is not
+				// pinned by any other argument, so the polymorphic type cannot be inferred from it.
+				set_caret_label("untyped; its type cannot be determined here");
+				error(operand.expr, "Cannot infer the polymorphic type '%s' from this argument", pts);
+				error_line("\tname the type explicitly (e.g. 'T{...}'), or determine '%s' from another argument\n", pts);
+			} else {
+				gbString ots = type_to_string(operand.type, true);
+				defer (gb_string_free(ots));
+				error(operand.expr, "Cannot determine polymorphic type from parameter: '%s' to '%s'", ots, pts);
+				if (operand.mode == Addressing_Type) {
+					error_line("\tSuggestion: Are you trying to pass a type to a value parameter?\n");
+				}
+			}
+		}
+		return t_invalid;
+	}
+
+	{
+		PolySubst subst = {};
+		subst.items.allocator = heap_allocator();
+		defer (array_free(&subst.items));
+		if (subst_unify(ctx, poly_type, operand.type, &subst) == Subst_Matched) {
+			if (modify_type) {
+				Type *applied = subst_apply(ctx, poly_type, operand.type, &subst);
+				subst_bind_entities(&subst);
+				return applied;
+			}
+			return poly_type; // probe: matched, no construction/binding needed
+		}
+	}
+	if (show_error) {
+		ERROR_BLOCK();
+		gbString pts = type_to_string(poly_type);
+		gbString ots = type_to_string(operand.type, true);
+		defer (gb_string_free(pts));
+		defer (gb_string_free(ots));
+		if (poly_type->kind == Type_Generic && poly_type->Generic.specialized != nullptr) {
+			// Constrained generic (`$T/Constraint`): the argument's type does not satisfy the constraint.
+			gbString cs = type_to_string(poly_type->Generic.specialized);
+			gbString cl = gb_string_append_fmt(gb_string_make(heap_allocator(), ""), "'%s' is not a '%s'", ots, cs);
+			set_caret_label(cl);
+			error(operand.expr, "Argument's type '%s' does not satisfy the polymorphic constraint '%s'", ots, cs);
+			gb_string_free(cl);
+			gb_string_free(cs);
+		} else {
+			error(operand.expr, "Cannot determine polymorphic type from parameter: '%s' to '%s'", ots, pts);
+		}
+
+		Type *pt = poly_type;
+		while (pt && pt->kind == Type_Generic && pt->Generic.specialized) {
+			pt = pt->Generic.specialized;
+		}
+		if (is_type_slice(pt) &&
+		    (is_type_dynamic_array(operand.type) || is_type_array(operand.type))) {
+			Ast *expr = unparen_expr(operand.expr);
+			if (expr->kind == Ast_CompoundLit) {
+				gbString es = type_to_string(base_any_array_type(operand.type));
+				error_line("\tSuggestion: Try using a slice compound literal instead '[]%s{...}'\n", es);
+				gb_string_free(es);
+			} else {
+				gbString os = expr_to_string(operand.expr);
+				error_line("\tSuggestion: Try slicing the value with '%s[:]'\n", os);
+				gb_string_free(os);
+			}
+		} else if (is_type_pointer(poly_type)) {
+			if (subst_poly_assignable(ctx, type_deref(poly_type), operand.type, /*modify_type*/false)) {
+				gbString os = expr_to_string(operand.expr);
+				error_line("\tSuggestion: Did you mean '&%s'?\n", os);
+				gb_string_free(os);
+			}
+		}
+	}
+	return t_invalid;
+}
+
+gb_internal Array<Operand> poly_operands_with_definite_types(CheckerContext *c, TypeProc *pt, Array<Operand> const &operands) {
+	Array<Operand> result = {};
+	if (pt->params == nullptr) {
+		return result;
+	}
+	Slice<Entity *> const &params = pt->params->Tuple.variables;
+	isize n = gb_min(params.count, operands.count);
+
+	auto is_untyped_declaring_generic = [&](isize i) -> bool {
+		Entity *p = params[i];
+		Operand const &o = operands[i];
+		if (p->kind != Entity_Variable || p->type->kind != Type_Generic) {
+			return false;
+		}
+		if (!o.deferred_untyped_arg && !(is_operand_value(o) && is_type_untyped(o.type))) {
+			return false;
+		}
+
+		// NOTE(bill): `$T` is written after the names of the parameters it declares
+		Entity *te = poly_generic_entity(p->type);
+		if (te == nullptr || te->token.pos <= p->token.pos) {
+			return false;
+		}
+		for (isize k = 0; k < i; k++) {
+			if (params[k]->type == p->type) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	bool any_untyped = false;
+	for (isize i = 0; i < n; i++) {
+		if (is_untyped_declaring_generic(i)) {
+			any_untyped = true;
+			break;
+		}
+	}
+	if (!any_untyped) {
+		return result;
+	}
+
+	PolySubst subst = {};
+	subst.items.allocator = temporary_allocator();
+	for (isize i = 0; i < n; i++) {
+		Entity *p = params[i];
+		Operand const &o = operands[i];
+		bool definite = false;
+		if (p->kind == Entity_TypeName) {
+			definite = o.mode == Addressing_Type;
+		} else if (p->kind == Entity_Variable) {
+			definite = !o.deferred_untyped_arg && is_operand_value(o) && is_type_typed(o.type);
+		}
+		if (!definite || !is_type_polymorphic(p->type) || is_type_polymorphic(o.type)) {
+			continue;
+		}
+		PolySubst one = {};
+		one.items.allocator = temporary_allocator();
+		if (subst_unify(c, p->type, o.type, &one) == Subst_Matched) {
+			for (PolyBinding const &b : one.items) {
+				poly_subst_add(&subst, b.key, b);
+			}
+		}
+	}
+
+	for (isize i = 0; i < n; i++) {
+		if (!is_untyped_declaring_generic(i)) {
+			continue;
+		}
+		PolyBinding *b = poly_subst_find(&subst, poly_generic_entity(params[i]->type));
+		if (b == nullptr || b->kind != PolyBind_Type) {
+			continue;
+		}
+		if (!operands[i].deferred_untyped_arg && are_types_identical(b->type, default_type(operands[i].type))) {
+			continue;
+		}
+		if (result.data == nullptr) {
+			result = array_make<Operand>(temporary_allocator(), operands.count);
+			array_copy(&result, operands, 0);
+		}
+		Operand bound = {Addressing_Value};
+		bound.type = b->type;
+		bound.expr = operands[i].expr;
+		result[i] = bound;
+	}
+	return result;
+}
+
+gb_internal bool is_expr_from_a_parameter(CheckerContext *ctx, Ast *expr) {
+	if (expr == nullptr) {
+		return false;
+	}
+	expr = unparen_expr(expr);
+	if (expr->kind == Ast_SelectorExpr) {
+		Ast *lhs = expr->SelectorExpr.expr;
+		return is_expr_from_a_parameter(ctx, lhs);
+	} else if (expr->kind == Ast_Ident) {
+		Operand x= {};
+		Entity *e = check_ident(ctx, &x, expr, nullptr, nullptr, true);
+		GB_ASSERT(e != nullptr);
+
+		if (e->flags & EntityFlag_Param) {
+			return true;
+		}
+	}
+	return false;
+}
+
+gb_internal bool is_caller_expression(Ast *expr) {
+	if (expr->kind == Ast_BasicDirective && expr->BasicDirective.name.string == "caller_expression") {
+		return true;
+	}
+
+	Ast *call = unparen_expr(expr);
+	if (call->kind != Ast_CallExpr) {
+		return false;
+	}
+
+	ast_node(ce, CallExpr, call);
+	if (ce->proc->kind != Ast_BasicDirective) {
+		return false;
+	}
+
+	ast_node(bd, BasicDirective, ce->proc);
+	String name = bd->name.string;
+	return name == "caller_expression";
+}
+
+gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location) {
+	ParameterValue param_value = {};
+	param_value.original_ast_expr = expr;
+	if (expr == nullptr) {
+		return param_value;
+	}
+	Operand o = {};
+
+	if (allow_caller_location &&
+	    expr->kind == Ast_BasicDirective &&
+	    expr->BasicDirective.name.string == "caller_location") {
+		init_core_source_code_location(ctx->checker);
+		param_value.kind = ParameterValue_Location;
+		o.type = t_source_code_location;
+		o.mode = Addressing_Value;
+		o.expr = expr;
+
+		if (in_type) {
+			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
+		}
+	} else if (is_caller_expression(expr)) {
+		if (expr->kind != Ast_BasicDirective) {
+			check_builtin_procedure_directive(ctx, &o, expr, t_string);
+		}
+
+		param_value.kind = ParameterValue_Expression;
+		o.type = t_string;
+		o.mode = Addressing_Value;
+		o.expr = expr;
+
+		if (in_type) {
+			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
+		}
+	} else {
+		expr = unparen_expr(expr);
+		if (expr && expr->kind == Ast_Uninit) {
+			error(expr, "Default parameter cannot be ---");
+		} else if (in_type) {
+			check_expr_with_type_hint(ctx, &o, expr, in_type);
+		} else {
+			check_expr(ctx, &o, expr);
+		}
+
+		if (in_type) {
+			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
+		}
+
+
+		if (is_operand_nil(o)) {
+			param_value.kind = ParameterValue_Nil;
+		} else if (o.mode != Addressing_Constant) {
+			if (expr->kind == Ast_ProcLit) {
+				param_value.kind = ParameterValue_Constant;
+				param_value.value = exact_value_procedure(expr);
+			} else {
+				Entity *e = entity_from_expr(o.expr);
+
+				if (e != nullptr) {
+					if (e->kind == Entity_Procedure) {
+						param_value.kind = ParameterValue_Constant;
+						param_value.value = exact_value_procedure(e->identifier);
+						param_value.proc_entity = e;
+						add_entity_use(ctx, e->identifier, e);
+					} else {
+						if (e->flags & EntityFlag_Param) {
+							error(expr, "Default parameter cannot be another parameter");
+						} else {
+							if (is_expr_from_a_parameter(ctx, expr)) {
+								error(expr, "Default parameter cannot be another parameter");
+							} else {
+								param_value.kind = ParameterValue_Value;
+								param_value.ast_value = expr;
+								add_entity_use(ctx, e->identifier, e);
+							}
+						}
+					}
+				} else if (allow_caller_location && o.mode == Addressing_Context) {
+					param_value.kind = ParameterValue_Value;
+					param_value.ast_value = expr;
+				} else if (o.value.kind != ExactValue_Invalid) {
+					param_value.kind = ParameterValue_Constant;
+					param_value.value = o.value;
+				} else {
+					gbString s = expr_to_string(o.expr);
+					error(expr, "Default parameter must be a constant, got %s", s);
+					gb_string_free(s);
+				}
+			}
+		} else {
+			if (o.value.kind != ExactValue_Invalid) {
+				param_value.kind = ParameterValue_Constant;
+				param_value.value = o.value;
+			} else {
+				gbString s = expr_to_string(o.expr);
+				error(o.expr, "Invalid constant parameter, got '%s'", s);
+				// error(o.expr, "Invalid constant parameter, got '%s' %d %d", s, o.mode, o.value.kind);
+				gb_string_free(s);
+			}
+		}
+	}
+
+	if (out_type_) {
+		if (in_type != nullptr) {
+			*out_type_ = in_type;
+		} else {
+			*out_type_ = default_type(o.type);
+		}
+	}
+
+	return param_value;
+}
+
+
+gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is_variadic_, isize *variadic_index_, bool *success_, isize *specialization_count_, Array<Operand> const *operands) {
+	if (_params == nullptr) {
+		return nullptr;
+	}
+
+	bool success = true;
+	ast_node(field_list, FieldList, _params);
+	Slice<Ast *> params = field_list->list;
+
+	if (params.count == 0) {
+		if (success_) *success_ = success;
+		return nullptr;
+	}
+
+	isize variable_count = 0;
+	for_array(i, params) {
+		Ast *field = params[i];
+		if (ast_node_expect(field, Ast_Field)) {
+			ast_node(f, Field, field);
+			variable_count += gb_max(f->names.count, 1);
+		}
+	}
+	isize min_variable_count = variable_count;
+	for (isize i = params.count-1; i >= 0; i--) {
+		Ast *field = params[i];
+		if (field->kind == Ast_Field) {
+			ast_node(f, Field, field);
+			if (f->default_value == nullptr)  {
+				break;
+			}
+			min_variable_count--;
+		}
+	}
+
+
+	bool is_variadic = false;
+	isize variadic_index = -1;
+	bool is_c_vararg = false;
+	auto variables = array_make<Entity *>(permanent_allocator(), 0, variable_count);
+	i32 field_group_index = -1;
+
+
+	Entity *entities_to_use = permanent_alloc_array<Entity>(variable_count);
+	isize entities_to_use_index = 0;
+
+	for_array(i, params) {
+		Ast *param = params[i];
+		if (param->kind != Ast_Field) {
+			continue;
+		}
+		field_group_index += 1;
+		ast_node(p, Field, param);
+		Ast *type_expr = unparen_expr(p->type);
+		Type *type = nullptr;
+		Ast *default_value = unparen_expr(p->default_value);
+		ParameterValue param_value = {};
+
+		bool is_type_param = false;
+		bool is_type_polymorphic_type = false;
+		bool detemine_type_from_operand = false;
+		Type *specialization = nullptr;
+
+		bool is_using = (p->flags&FieldFlag_using) != 0;
+
+
+		u64 feature_flags = check_feature_flags(ctx, param);
+
+		if (is_using && (feature_flags & OptInFeatureFlag_UsingStmt) == 0) {
+			ERROR_BLOCK();
+			error(param, "'using' has been disallowed as it is considered bad practice to use as a statement/procedure parameter outside of immediate refactoring");
+			error_line("\tIf you do require it for refactoring purposes or legacy code, it can be enabled on a per-file basis with '#+feature using-stmt'\n");
+		}
+
+		if (type_expr == nullptr) {
+			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, true);
+		} else {
+			Ast *original_type_expr = type_expr;
+			if (type_expr->kind == Ast_Ellipsis) {
+				type_expr = type_expr->Ellipsis.expr;
+				is_variadic = true;
+				variadic_index = variables.count;
+				if (p->names.count != 1) {
+					error(param, "Invalid AST: Invalid variadic parameter with multiple names");
+					success = false;
+				}
+
+				if (default_value != nullptr) {
+					error(type_expr, "A variadic parameter may not have a default value");
+					success = false;
+				}
+
+				GB_ASSERT(original_type_expr->kind == Ast_Ellipsis);
+				type_expr = ast_array_type(type_expr->file(), original_type_expr->Ellipsis.token, nullptr, type_expr);
+			}
+			if (type_expr->kind == Ast_TypeidType)  {
+				ast_node(tt, TypeidType, type_expr);
+				if (tt->specialization) {
+					specialization = check_type(ctx, tt->specialization);
+					if (specialization == t_invalid){
+						specialization = nullptr;
+					}
+
+					if (operands != nullptr) {
+						detemine_type_from_operand = true;
+						type = t_invalid;
+					} else {
+						type = alloc_type_generic(ctx->scope, 0, string_interner_insert(str_lit("")), specialization);
+					}
+				} else {
+					type = t_typeid;
+				}
+			} else {
+				bool prev = ctx->allow_polymorphic_types;
+				if (operands != nullptr) {
+					ctx->allow_polymorphic_types = true;
+				}
+
+				type = check_type(ctx, type_expr);
+
+				ctx->allow_polymorphic_types = prev;
+
+				if (is_type_polymorphic(type)) {
+					is_type_polymorphic_type = true;
+				}
+			}
+
+			if (default_value != nullptr) {
+				if (type_expr != nullptr && type_expr->kind == Ast_TypeidType) {
+					error(type_expr, "A type parameter may not have a default value");
+				} else if (is_type_polymorphic(type)) {
+					// NOTE(bill): The parameter type is still polymorphic (`$T`, `[N]$T`, ...),
+					// so the default value cannot be checked against it yet.
+					// Evaluate it as a constant now without the assignment check.
+					// It is validated against the concrete parameter type when the procedure is instantiated (which re-runs this with a non-polymorphic `type`).
+					param_value = handle_parameter_value(ctx, nullptr, nullptr, default_value, true);
+				} else {
+					param_value = handle_parameter_value(ctx, type, nullptr, default_value, true);
+				}
+			}
+		}
+
+
+
+		if (type == nullptr) {
+			error(param, "Invalid parameter type");
+			type = t_invalid;
+		}
+		if (is_type_untyped(type)) {
+			if (is_type_untyped_uninit(type)) {
+				error(param, "Cannot determine parameter type from ---");
+			} else {
+				error(param, "Cannot determine parameter type from a nil");
+			}
+			type = t_invalid;
+		}
+		// if (is_type_empty_union(type)) {
+		// 	gbString str = type_to_string(type);
+		// 	error(param, "Invalid use of an empty union '%s'", str);
+		// 	gb_string_free(str);
+		// 	type = t_invalid;
+		// }
+
+		if (is_type_polymorphic(type)) {
+			switch (param_value.kind) {
+			case ParameterValue_Invalid:
+			case ParameterValue_Constant:
+			case ParameterValue_Nil:
+				break;
+			case ParameterValue_Location:
+			case ParameterValue_Expression:
+			case ParameterValue_Value:
+				// Special case for polymorphic procedures as default values
+				if (param_value.ast_value != nullptr) {
+					Entity *e = entity_from_expr(param_value.ast_value);
+					if (e != nullptr && e->kind == Entity_Procedure && is_type_polymorphic(e->type)) {
+						// Allow polymorphic procedures as default parameter values
+						// The type will be correctly determined at call site
+						break;
+					}
+				}
+				gbString str = type_to_string(type);
+				error(params[i], "A default value for a parameter must not be a polymorphic constant type, got %s", str);
+					gb_string_free(str);
+				break;
+			}
+		}
+
+
+		if (p->flags&FieldFlag_c_vararg) {
+			if (p->type == nullptr ||
+			    p->type->kind != Ast_Ellipsis) {
+				error(param, "'#c_vararg' can only be applied to variadic type fields");
+				p->flags &= ~FieldFlag_c_vararg; // Remove the flag
+			} else {
+				is_c_vararg = true;
+			}
+		}
+
+		for_array(j, p->names) {
+			Ast *name = p->names[j];
+
+			bool is_poly_name = false;
+
+			switch (name->kind) {
+			case Ast_Ident:
+				break;
+			case Ast_PolyType:
+				GB_ASSERT(name->PolyType.specialization == nullptr);
+				is_poly_name = true;
+				name = name->PolyType.type;
+				break;
+			}
+			if (!ast_node_expect(name, Ast_Ident)) {
+				continue;
+			}
+
+			if (is_poly_name) {
+				if (type_expr != nullptr && type_expr->kind == Ast_TypeidType) {
+					is_type_param = true;
+				} else {
+					if (param_value.kind != ParameterValue_Invalid)  {
+						error(default_value, "Constant parameters cannot have a default value");
+						param_value.kind = ParameterValue_Invalid;
+					}
+				}
+			}
+
+			Entity *param = nullptr;
+			if (is_type_param) {
+				if (operands != nullptr) {
+					Operand o = (*operands)[variables.count];
+					if (o.mode == Addressing_Type) {
+						type = o.type;
+					} else {
+						if (!ctx->no_polymorphic_errors) {
+							error(o.expr, "Expected a type to assign to the type parameter");
+						}
+						success = false;
+						type = t_invalid;
+					}
+					if (is_type_polymorphic(type)) {
+						gbString str = type_to_string(type);
+						error(o.expr, "Cannot pass polymorphic type as a parameter, got '%s'", str);
+						gb_string_free(str);
+						success = false;
+						type = t_invalid;
+					}
+					if (is_type_untyped(default_type(type))) {
+						gbString str = type_to_string(type);
+						error(o.expr, "Cannot determine type from the parameter, got '%s'", str);
+						gb_string_free(str);
+						success = false;
+						type = t_invalid;
+					}
+					bool modify_type = !ctx->no_polymorphic_errors;
+
+					if (specialization != nullptr && !subst_check_specialization(ctx, specialization, type, modify_type)) {
+						if (!ctx->no_polymorphic_errors) {
+							gbString t = type_to_string(type);
+							gbString s = type_to_string(specialization);
+							error(o.expr, "Cannot convert type '%s' to the specialization '%s'", t, s);
+							gb_string_free(s);
+							gb_string_free(t);
+						}
+						success = false;
+						type = t_invalid;
+					}
+				}
+
+				if (p->flags&FieldFlag_const) {
+					error(name, "'#const' can only be applied to variable fields");
+					p->flags &= ~FieldFlag_const;
+				}
+				if (p->flags&FieldFlag_any_int) {
+					error(name, "'#any_int' can only be applied to variable fields");
+					p->flags &= ~FieldFlag_any_int;
+				}
+				if (p->flags&FieldFlag_no_broadcast) {
+					error(name, "'#no_broadcast' can only be applied to variable fields");
+					p->flags &= ~FieldFlag_no_broadcast;
+				}
+				if (p->flags&FieldFlag_by_ptr) {
+					error(name, "'#by_ptr' can only be applied to variable fields");
+					p->flags &= ~FieldFlag_by_ptr;
+				}
+				if (p->flags&FieldFlag_no_capture) {
+					error(name, "'#no_capture' can only be applied to variable fields");
+					p->flags &= ~FieldFlag_no_capture;
+				}
+
+				Type *param_type = type;
+				if (operands == nullptr && param_type == t_typeid) {
+					// NOTE(bill): In the generic signature, a `$T: typeid` without a specialization is its own
+					// polymorphic type, as one with a specialization already is, so that `^T` or `[]T` elsewhere
+					// in the signature remain polymorphic rather than becoming `^typeid` or `[]typeid`
+					param_type = alloc_type_generic(ctx->scope, 0, name->Ident.interned, nullptr);
+				}
+
+				param = &entities_to_use[entities_to_use_index++];
+				INTERNAL_ENTITY_INIT(param, Entity_TypeName, scope, name->Ident.token, param_type);
+				param->state = EntityState_Resolved;
+				param->interned_name.store(name->Ident.interned);
+				param->interned_name_hash.store(name->Ident.hash);
+
+				param->TypeName.is_type_alias = true;
+				if (param_type != type) {
+					param_type->Generic.entity = param;
+				}
+			} else {
+				ExactValue poly_const = {};
+
+				if (operands != nullptr && variables.count < operands->count) {
+					Operand op = (*operands)[variables.count];
+					if (op.expr == nullptr) {
+						// NOTE(bill): 2019-03-30
+						// This is just to add the error message to determine_type_from_polymorphic which
+						// depends on valid position information
+						op.expr = _params;
+
+						// NOTE(taylbr): Can still have valid type with null expr. Needed for resolving
+						if (op.mode == Addressing_Invalid || op.type == nullptr) {
+							op.mode = Addressing_Invalid;
+							op.type = t_invalid;
+						}
+					}
+					if (is_type_polymorphic_type) {
+						type = determine_type_from_polymorphic(ctx, type, op);
+						if (type == t_invalid) {
+							success = false;
+						} else if (!ctx->no_polymorphic_errors) {
+							// NOTE(bill): The type should be determined now and thus, no need to determine the type any more
+							is_type_polymorphic_type = false;
+							Entity *proc_entity = entity_from_expr(op.expr);
+							if ((proc_entity != nullptr) && (op.value.kind == ExactValue_Procedure)) {
+								if (is_type_polymorphic(proc_entity->type, false)) {
+									error(op.expr, "Cannot determine complete type of partial polymorphic procedure");
+								}
+							}
+						}
+					}
+					if (is_poly_name) {
+						bool valid = false;
+						// NOTE: a polymorphic procedure passed to a `$f: proc(...)` parameter is specialized
+						// to that parameter's type, and the specialization becomes the constant value
+						Entity *specialized_proc_entity = nullptr;
+						bool poly_proc_failed = false;
+						if (is_type_proc(op.type) && is_type_polymorphic(op.type)) {
+							if (is_type_proc(type) && !is_type_polymorphic(type)) {
+								PolyProcData ppd = {};
+								if (check_polymorphic_procedure_assignment(ctx, &op, type, op.expr, &ppd)) {
+									specialized_proc_entity = ppd.gen_entity;
+									op.type = specialized_proc_entity->type;
+								}
+							}
+							if (specialized_proc_entity == nullptr) {
+								// NOTE: the assignability check below reports the error
+								valid = true;
+								success = false;
+								poly_proc_failed = true;
+							}
+						}
+						if (!poly_proc_failed && is_type_proc(op.type)) {
+							Ast *expr = unparen_expr(op.expr);
+							Entity *proc_entity = specialized_proc_entity;
+							if (proc_entity == nullptr) {
+								proc_entity = strip_entity_wrapping(expr);
+							}
+							if (proc_entity) {
+								proc_entity->flags |= EntityFlag_PolyConstArg;
+								poly_const = exact_value_procedure(proc_entity->identifier.load() ? proc_entity->identifier.load() : op.expr);
+								valid = true;
+							} else if (expr->kind == Ast_ProcLit) {
+								poly_const = exact_value_procedure(expr);
+								valid = true;
+							}
+						}
+						if (!valid) {
+							if (op.mode == Addressing_Constant) {
+								poly_const = op.value;
+								if (poly_const.kind == ExactValue_Integer && is_type_float(type)) {
+									poly_const.kind = ExactValue_Float;
+									poly_const.value_float = big_int_to_f64(&poly_const.value_integer);
+								}
+							} else {
+								if (!ctx->in_proc_group) {
+									error(op.expr, "Expected a constant value for this polymorphic name parameter, got %s", expr_to_string(op.expr));
+								}
+								success = false;
+							}
+						}
+					}
+
+					bool allow_array_programming = true;
+					if (p->flags&FieldFlag_no_broadcast) {
+						allow_array_programming = false;
+					}
+
+					if (type != t_invalid && !check_is_assignable_to(ctx, &op, type, allow_array_programming)) {
+						bool ok = true;
+						if (p->flags&FieldFlag_any_int) {
+							if (op.type == nullptr) {
+								ok = false;
+							} else if ((!is_type_integer(op.type) && !is_type_enum(op.type)) || (!is_type_integer(type) && !is_type_enum(type))) {
+								ok = false;
+							} else if (!check_is_castable_to(ctx, &op, type)) {
+								ok = false;
+							}
+						}
+						if (!ok) {
+							success = false;
+							#if 0
+								gbString got = type_to_string(op.type);
+								gbString expected = type_to_string(type);
+								error(op.expr, "Cannot assigned type to parameter, got type '%s', expected '%s'", got, expected);
+								gb_string_free(expected);
+								gb_string_free(got);
+							#endif
+						}
+					}
+
+					if (is_type_untyped(default_type(type))) {
+						gbString str = type_to_string(type);
+						error(op.expr, "Cannot determine type from the parameter, got '%s'", str);
+						gb_string_free(str);
+						success = false;
+						type = t_invalid;
+					}
+				}
+
+				if (p->flags&FieldFlag_no_alias) {
+					// If type == t_invalid, we either already errored (and erroring again here is just log
+					// noise) or we are rejecting a polymorphic proc group overload candidate.
+					// If no_polymorphic_errors is set, we are speculatively checking a candidate and
+					// erroring+stripping is premature: the chosen candidate will be re-checked with errors enabled,
+					// so a true error isn't lost.
+					if (type != t_invalid && !is_type_internally_pointer_like(type) && !ctx->no_polymorphic_errors) {
+						error(name, "'#no_alias' can only be applied to pointer-like type parameters");
+						p->flags &= ~FieldFlag_no_alias; // Remove the flag
+					}
+				}
+				if (p->flags&FieldFlag_by_ptr) {
+					if (is_type_internally_pointer_like(type)) {
+						error(name, "'#by_ptr' can only be applied to non-pointer-like parameters");
+						p->flags &= ~FieldFlag_by_ptr; // Remove the flag
+					}
+				}
+				if (p->flags&FieldFlag_no_capture) {
+					if (is_variadic && variadic_index == variables.count) {
+						if (p->flags & FieldFlag_c_vararg) {
+							error(name, "'#no_capture' cannot be applied to a #c_vararg parameter");
+							p->flags &= ~FieldFlag_no_capture;
+						} else {
+							error(name, "'#no_capture' is already implied on all variadic parameter");
+						}
+					} else if (is_type_polymorphic(type)) {
+						// ignore
+					} else {
+						if (is_type_internally_pointer_like(type)) {
+							error(name, "'#no_capture' is currently reserved for future use");
+						} else {
+							ERROR_BLOCK();
+							error(name, "'#no_capture' can only be applied to pointer-like types");
+							error_line("\t'#no_capture' does not currently do anything useful\n");
+							p->flags &= ~FieldFlag_no_capture;
+						}
+					}
+				}
+
+
+				if (is_poly_name) {
+					if (p->flags&FieldFlag_no_alias) {
+						error(name, "'#no_alias' can only be applied to non constant values");
+						p->flags &= ~FieldFlag_no_alias; // Remove the flag
+					}
+					if (p->flags&FieldFlag_any_int) {
+						error(name, "'#any_int' can only be applied to variable fields");
+						p->flags &= ~FieldFlag_any_int;
+					}
+					if (p->flags&FieldFlag_const) {
+						error(name, "'#const' can only be applied to variable fields");
+						p->flags &= ~FieldFlag_const;
+					}
+					if (p->flags&FieldFlag_by_ptr) {
+						error(name, "'#by_ptr' can only be applied to variable fields");
+						p->flags &= ~FieldFlag_by_ptr;
+					}
+					if (p->flags&FieldFlag_no_capture) {
+						error(name, "'#no_capture' can only be applied to variable fields");
+						p->flags &= ~FieldFlag_no_capture;
+					}
+
+
+					if (!is_type_polymorphic(type) && check_constant_parameter_value(type, params[i])) {
+						// failed
+					}
+
+					// param = alloc_entity_const_param(scope, name->Ident.token, type, poly_const, is_type_polymorphic(type));
+
+					param = &entities_to_use[entities_to_use_index++];
+					INTERNAL_ENTITY_INIT(param, Entity_Constant, scope, name->Ident.token, type);
+
+					param->flags |= EntityFlag_Used|EntityFlag_Param;
+					if (is_type_polymorphic(type)) {
+						param->flags |= EntityFlag_PolyConst;
+					}
+					param->Constant.value = poly_const;
+
+					param->interned_name.store(name->Ident.interned);
+					param->interned_name_hash.store(name->Ident.hash);
+
+					param->Constant.field_group_index = field_group_index;
+				} else {
+					// param = alloc_entity_param(scope, name->Ident.token, type, is_using, true);
+
+					param = &entities_to_use[entities_to_use_index++];
+					INTERNAL_ENTITY_INIT(param, Entity_Variable, scope, name->Ident.token, type);
+
+					param->state = EntityState_Resolved;
+					param->flags |= EntityFlag_Used|EntityFlag_Param|EntityFlag_Value;
+					if (is_using) {
+						param->flags |= EntityFlag_Using;
+					}
+
+					param->interned_name.store(name->Ident.interned);
+					param->interned_name_hash.store(name->Ident.hash);
+
+					param->Variable.param_value = param_value;
+					param->Variable.field_group_index = field_group_index;
+					param->Variable.type_expr = type_expr;
+				}
+			}
+
+			if (is_variadic && variadic_index == variables.count) {
+				param->flags |= EntityFlag_Ellipsis;
+				if (is_c_vararg) {
+					param->flags |= EntityFlag_CVarArg;
+				} else {
+					param->flags |= EntityFlag_NoCapture;
+				}
+			}
+
+			if (p->flags&FieldFlag_no_alias) {
+				param->flags |= EntityFlag_NoAlias;
+			}
+			if (p->flags&FieldFlag_no_broadcast) {
+				param->flags |= EntityFlag_NoBroadcast;
+			}
+
+			if (p->flags&FieldFlag_any_int) {
+				if (!is_type_integer(param->type) && !is_type_enum(param->type)) {
+					gbString str = type_to_string(param->type);
+					error(name, "A parameter with '#any_int' must be an integer, got %s", str);
+					gb_string_free(str);
+				}
+				param->flags |= EntityFlag_AnyInt;
+			}
+			if (p->flags&FieldFlag_const) {
+				param->flags |= EntityFlag_ConstInput;
+			}
+			if (p->flags&FieldFlag_by_ptr) {
+				param->flags |= EntityFlag_ByPtr;
+			}
+			if (p->flags&FieldFlag_no_capture) {
+				param->flags |= EntityFlag_NoCapture;
+			}
+
+
+			param->state = EntityState_Resolved; // NOTE(bill): This should have be resolved whilst determining it
+			add_entity(ctx, scope, name, param);
+			if (is_using) {
+				add_entity_use(ctx, name, param);
+			}
+			array_add(&variables, param);
+		}
+	}
+
+
+	if (is_variadic) {
+		GB_ASSERT(variadic_index >= 0);
+		GB_ASSERT(params.count > 0);
+	}
+
+	isize specialization_count = 0;
+	if (scope != nullptr) {
+		for (auto const &entry : scope->elements) {
+			Entity *e = entry.value;
+			if (e->kind == Entity_TypeName) {
+				Type *t = e->type;
+				if (t->kind == Type_Generic &&
+				    t->Generic.specialized != nullptr) {
+					specialization_count += 1;
+				}
+			}
+		}
+	}
+
+	Type *tuple = alloc_type_tuple();
+	tuple->Tuple.variables = slice_from_array(variables);
+
+	if (success_) *success_ = success;
+	if (specialization_count_) *specialization_count_ = specialization_count;
+	if (is_variadic_) *is_variadic_ = is_variadic;
+	if (variadic_index_) *variadic_index_ = variadic_index;
+
+	return tuple;
+}
+
+// Check if an AST node references any polymorphic type parameters
+// TODO(bill): is this even complete enough?
+gb_internal bool ast_references_poly_params(Scope *scope, Ast *node) {
+	if (node == nullptr) {
+		return false;
+	}
+	switch (node->kind) {
+	case Ast_Ident: {
+		Entity *e = scope_lookup(scope, node->Ident.interned, node->Ident.hash);
+		if (e != nullptr && e->kind == Entity_TypeName && e->type != nullptr && e->type->kind == Type_Generic) {
+			return true;
+		}
+		return false;
+	}
+	case Ast_SelectorExpr:
+		return ast_references_poly_params(scope, node->SelectorExpr.expr);
+	case Ast_IndexExpr:
+		return ast_references_poly_params(scope, node->IndexExpr.expr);
+	case Ast_CallExpr:
+		for (Ast *arg : node->CallExpr.args) {
+			if (ast_references_poly_params(scope, arg)) {
+				return true;
+			}
+		}
+		return ast_references_poly_params(scope, node->CallExpr.proc);
+	case Ast_CompoundLit:
+		return ast_references_poly_params(scope, node->CompoundLit.type);
+	case Ast_UnaryExpr:
+		return ast_references_poly_params(scope, node->UnaryExpr.expr);
+	case Ast_BinaryExpr:
+		return ast_references_poly_params(scope, node->BinaryExpr.left) ||
+		       ast_references_poly_params(scope, node->BinaryExpr.right);
+	case Ast_TernaryIfExpr:
+		return ast_references_poly_params(scope, node->TernaryIfExpr.x)    ||
+		       ast_references_poly_params(scope, node->TernaryIfExpr.cond) ||
+		       ast_references_poly_params(scope, node->TernaryIfExpr.y);
+	case Ast_TernaryWhenExpr:
+		return ast_references_poly_params(scope, node->TernaryWhenExpr.x)    ||
+		       ast_references_poly_params(scope, node->TernaryWhenExpr.cond) ||
+		       ast_references_poly_params(scope, node->TernaryWhenExpr.y);
+	case Ast_ParenExpr:
+		return ast_references_poly_params(scope, node->ParenExpr.expr);
+	case Ast_DerefExpr:
+		return ast_references_poly_params(scope, node->DerefExpr.expr);
+	case Ast_PointerType:
+		return ast_references_poly_params(scope, node->PointerType.type);
+	case Ast_ArrayType:
+		return ast_references_poly_params(scope, node->ArrayType.elem) ||
+		       ast_references_poly_params(scope, node->ArrayType.count);
+	case Ast_FixedCapacityDynamicArrayType:
+		return ast_references_poly_params(scope, node->FixedCapacityDynamicArrayType.elem) ||
+		       ast_references_poly_params(scope, node->FixedCapacityDynamicArrayType.capacity);
+       case Ast_DynamicArrayType:
+	       	return ast_references_poly_params(scope, node->DynamicArrayType.elem);
+	case Ast_MapType:
+		return ast_references_poly_params(scope, node->MapType.key) ||
+		       ast_references_poly_params(scope, node->MapType.value);
+	}
+	return false;
+}
+
+gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_results) {
+	if (_results == nullptr) {
+		return nullptr;
+	}
+	ast_node(field_list, FieldList, _results);
+	Slice<Ast *> results = field_list->list;
+
+	if (results.count == 0) {
+		return nullptr;
+	}
+	Type *tuple = alloc_type_tuple();
+
+	isize variable_count = 0;
+	for_array(i, results) {
+		Ast *field = results[i];
+		if (ast_node_expect(field, Ast_Field)) {
+			ast_node(f, Field, field);
+			variable_count += gb_max(f->names.count, 1);
+		}
+	}
+
+	Entity *entities_to_use = permanent_alloc_array<Entity>(variable_count);
+	isize entities_to_use_index = 0;
+
+	auto variables = array_make<Entity *>(permanent_allocator(), 0, variable_count);
+	i32 field_group_index = -1;
+	for_array(i, results) {
+		field_group_index += 1;
+
+		ast_node(field, Field, results[i]);
+		Ast *default_value = unparen_expr(field->default_value);
+		ParameterValue param_value = {};
+
+		Type *type = nullptr;
+		if (field->type == nullptr) {
+			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, false);
+		} else {
+			if (ctx->allow_polymorphic_types && ast_references_poly_params(ctx->scope, field->type)) {
+				gbString name = expr_to_string(field->type);
+				type = alloc_type_generic(ctx->scope, 0, string_interner_insert(make_string_c(name)), nullptr);
+				gb_string_free(name);
+			} else {
+				type = check_type(ctx, field->type);
+			}
+
+
+			if (default_value != nullptr) {
+				param_value = handle_parameter_value(ctx, type, nullptr, default_value, false);
+			}
+		}
+
+		if (type == nullptr) {
+			error(results[i], "Invalid parameter type");
+			type = t_invalid;
+		}
+		if (is_type_untyped(type)) {
+			error(results[i], "Cannot determine parameter type from a nil");
+			type = t_invalid;
+		}
+
+
+		if (field->names.count == 0) {
+			Token token = ast_token(field->type);
+			token.string = str_lit("");
+			// Entity *param = alloc_entity_param(scope, token, type, false, false);
+			Entity *param = &entities_to_use[entities_to_use_index++];
+			INTERNAL_ENTITY_INIT(param, Entity_Variable, scope, token, type);
+			param->state = EntityState_Resolved;
+			param->flags |= EntityFlag_Used|EntityFlag_Param|EntityFlag_Result;
+
+			param->Variable.param_value = param_value;
+			param->Variable.field_group_index = -1;
+			array_add(&variables, param);
+		} else {
+			for_array(j, field->names) {
+				Token token = ast_token(results[i]);
+				if (field->type != nullptr) {
+					token = ast_token(field->type);
+				}
+				token.string = str_lit("");
+
+				Ast *name = field->names[j];
+				if (name->kind != Ast_Ident) {
+					error(name, "Expected an identifer for as the field name");
+				} else {
+					token = name->Ident.token;
+				}
+
+				if (is_blank_ident(token))  {
+					error(name, "Result value cannot be a blank identifer `_`");
+				}
+
+				// Entity *param = alloc_entity_param(scope, token, type, false, false);
+				Entity *param = &entities_to_use[entities_to_use_index++];
+				INTERNAL_ENTITY_INIT(param, Entity_Variable, scope, token, type);
+				param->state = EntityState_Resolved;
+				param->flags |= EntityFlag_Used|EntityFlag_Param|EntityFlag_Result;
+
+				if (name->kind == Ast_Ident) {
+					param->interned_name.store(name->Ident.interned);
+					param->interned_name_hash.store(name->Ident.hash);
+				}
+
+				param->Variable.param_value = param_value;
+				param->Variable.field_group_index = field_group_index;
+				array_add(&variables, param);
+				add_entity(ctx, scope, name, param);
+				// NOTE(bill): Removes `declared but not used` when using -vet
+				add_entity_use(ctx, name, param);
+			}
+		}
+	}
+
+	for_array(i, variables) {
+		String x = variables[i]->token.string;
+		if (x.len == 0 || is_blank_ident(x)) {
+			continue;
+		}
+		for (isize j = i+1; j < variables.count; j++) {
+			String y = variables[j]->token.string;
+			if (y.len == 0 || is_blank_ident(y)) {
+				continue;
+			}
+			if (x == y) {
+				error(variables[j]->token, "Duplicate return value name '%.*s'", LIT(y));
+			}
+		}
+	}
+
+	tuple->Tuple.variables = slice_from_array(variables);
+
+	return tuple;
+}
+
+gb_internal void check_procedure_param_polymorphic_type(CheckerContext *ctx, Type *type, Ast *type_expr) {
+	if (type == nullptr || type_expr == nullptr || ctx->in_polymorphic_specialization) { return; }
+	if (!is_type_polymorphic_record_unspecialized(type)) { return; }
+
+	bool invalid_polymorpic_type_use = false;
+	switch (type_expr->kind) {
+	case_ast_node(pt, Ident, type_expr);
+		invalid_polymorpic_type_use = true;
+	case_end;
+
+	case_ast_node(pt, SelectorExpr, type_expr);
+		invalid_polymorpic_type_use = true;
+	case_end;
+	}
+
+	if (invalid_polymorpic_type_use) {
+		gbString expr_str = expr_to_string(type_expr);
+		defer (gb_string_free(expr_str));
+		error(type_expr, "Invalid use of a non-specialized polymorphic type '%s'", expr_str);
+	}
+}
+
+// NOTE(bill): 'operands' is for generating non generic procedure type
+gb_internal bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc_type_node, Array<Operand> const *operands) {
+	ast_node(pt, ProcType, proc_type_node);
+
+	if (ctx->polymorphic_scope == nullptr && ctx->allow_polymorphic_types) {
+		ctx->polymorphic_scope = ctx->scope;
+	}
+
+	CheckerContext c_ = *ctx;
+	CheckerContext *c = &c_;
+
+	c->curr_proc_sig = type;
+	c->in_proc_sig = true;
+
+
+	ProcCallingConvention cc = pt->calling_convention;
+	if (cc == ProcCC_ForeignBlockDefault) {
+		cc = ProcCC_CDecl;
+		if (c->foreign_context.default_cc > 0) {
+			cc = c->foreign_context.default_cc;
+		}
+	}
+	GB_ASSERT(cc > 0);
+	if (cc == ProcCC_Odin) {
+		c->scope->flags |= ScopeFlag_ContextDefined;
+	} else {
+		c->scope->flags &= ~ScopeFlag_ContextDefined;
+	}
+
+	TargetArchKind arch = build_context.metrics.arch;
+	switch (cc) {
+	case ProcCC_StdCall:
+	case ProcCC_FastCall:
+		if (arch != TargetArch_i386 && arch != TargetArch_amd64) {
+			error(proc_type_node, "Invalid procedure calling convention \"%s\" for target architecture, expected either i386 or amd64, got %.*s",
+			      proc_calling_convention_strings[cc], LIT(target_arch_names[arch]));
+		}
+		break;
+	case ProcCC_Win64:
+	case ProcCC_SysV:
+		if (arch != TargetArch_amd64) {
+			error(proc_type_node, "Invalid procedure calling convention \"%s\" for target architecture, expected amd64, got %.*s",
+			      proc_calling_convention_strings[cc], LIT(target_arch_names[arch]));
+		}
+		break;
+	}
+
+
+	bool variadic = false;
+	isize variadic_index = -1;
+	bool success = true;
+	isize specialization_count = 0;
+	Type *params  = check_get_params(c, c->scope, pt->params, &variadic, &variadic_index, &success, &specialization_count, operands);
+
+	bool no_poly_return = c->disallow_polymorphic_return_types;
+	c->disallow_polymorphic_return_types = c->scope == c->polymorphic_scope;
+	// NOTE(zen3ger): if the parapoly scope is the current proc's scope, then the return types shall not declare new poly vars
+	Type *results = check_get_results(c, c->scope, pt->results);
+	c->disallow_polymorphic_return_types = no_poly_return;
+
+	isize param_count = 0;
+	isize result_count = 0;
+	if (params)  param_count  = params ->Tuple.variables.count;
+	if (results) result_count = results->Tuple.variables.count;
+
+	if (result_count > 0) {
+		Entity *first = results->Tuple.variables[0];
+		type->Proc.has_named_results = first->token.string != "";
+	}
+
+	bool optional_ok = (pt->tags & ProcTag_optional_ok) != 0;
+	if (optional_ok) {
+		if (result_count != 2) {
+			error(proc_type_node, "A procedure type with the #optional_ok tag requires 2 return values, got %td", result_count);
+		} else {
+			Entity *second = results->Tuple.variables[1];
+			if (is_type_polymorphic(second->type)) {
+				// ignore
+			} else if (is_type_boolean(second->type)) {
+				// GOOD
+			} else {
+				error(second->token, "Second return value of an #optional_ok procedure must be a boolean, got %s", type_to_string(second->type));
+			}
+		}
+	}
+	if (pt->tags & ProcTag_optional_allocator_error) {
+		if (optional_ok) {
+			error(proc_type_node, "A procedure type cannot have both an #optional_ok tag and #optional_allocator_error");
+		}
+		optional_ok = true;
+		if (result_count != 2) {
+			error(proc_type_node, "A procedure type with the #optional_allocator_error tag requires 2 return values, got %td", result_count);
+		} else {
+			init_mem_allocator(c->checker);
+
+			Type *type = results->Tuple.variables[1]->type;
+			if (!are_types_identical(type, t_allocator_error)) {
+				gbString t = type_to_string(type);
+				error(proc_type_node, "A procedure type with the #optional_allocator_error expects a `runtime.Allocator_Error`, got '%s'", t);
+				gb_string_free(t);
+			}
+		}
+	}
+
+	type->Proc.node                 = proc_type_node;
+	type->Proc.scope                = c->scope;
+	type->Proc.params               = params;
+	type->Proc.param_count          = cast(i32)param_count;
+	type->Proc.results              = results;
+	type->Proc.result_count         = cast(i32)result_count;
+	type->Proc.variadic             = variadic;
+	type->Proc.variadic_index       = cast(i32)variadic_index;
+	type->Proc.calling_convention   = cc;
+	type->Proc.is_polymorphic       = pt->generic;
+	type->Proc.specialization_count = specialization_count;
+	type->Proc.diverging            = pt->diverging;
+	type->Proc.optional_ok          = optional_ok;
+
+	bool is_polymorphic = false;
+	for (isize i = 0; i < param_count; i++) {
+		Entity *e = params->Tuple.variables[i];
+
+		if (e->kind != Entity_Variable) {
+			is_polymorphic = true;
+		} else if (is_type_polymorphic(e->type)) {
+			check_procedure_param_polymorphic_type(c, e->type, e->Variable.type_expr);
+			is_polymorphic = true;
+		}
+
+		if (e->flags&EntityFlag_CVarArg) {
+			if (i != param_count - 1) {
+				error(e->token, "#c_vararg can only be applied to the last parameter");
+				continue;
+			}
+
+			switch (cc) {
+			default:
+				type->Proc.c_vararg = true;
+				break;
+			case ProcCC_Odin:
+			case ProcCC_Contextless:
+				error(e->token, "Calling convention does not support #c_vararg");
+				break;
+			}
+		}
+	}
+	for (isize i = 0; i < result_count; i++) {
+		Entity *e = results->Tuple.variables[i];
+		if (e->kind != Entity_Variable) {
+			is_polymorphic = true;
+			break;
+		} else if (is_type_polymorphic(e->type)) {
+			is_polymorphic = true;
+			break;
+		}
+	}
+	type->Proc.is_polymorphic = is_polymorphic;
+
+	return success;
+}
+
+
+gb_internal i64 check_array_count(CheckerContext *ctx, Operand *o, Ast *e) {
+	if (e == nullptr) {
+		return 0;
+	}
+	if (e->kind == Ast_UnaryExpr) {
+		Token op = e->UnaryExpr.op;
+		if (op.kind == Token_Question) {
+			return -1;
+		}
+		if (e->UnaryExpr.expr == nullptr) {
+			error(op, "Invalid array count '[%.*s]'", LIT(op.string));
+			return 0;
+		}
+	}
+
+	check_expr_or_type(ctx, o, e);
+	if (o->mode == Addressing_Type) {
+		Type *ot = base_type(o->type);
+
+		if (ot->kind == Type_Generic) {
+			if (ctx->allow_polymorphic_types) {
+				if (ot->Generic.specialized) {
+					ot->Generic.specialized = nullptr;
+					error(o->expr, "Polymorphic array length cannot have a specialization");
+				}
+				return 0;
+			}
+		}
+		if (is_type_enum(ot)) {
+			return -1;
+		}
+	}
+
+	if (o->mode != Addressing_Constant) {
+		if (o->mode != Addressing_Invalid) {
+			Entity *entity = entity_of_node(o->expr);
+			bool is_poly_type = false;
+			if (entity != nullptr) {
+				is_poly_type = \
+					entity->kind == Entity_TypeName &&
+					entity->type == t_typeid &&
+					entity->flags&EntityFlag_PolyConst;
+			}
+
+			// NOTE(bill, 2021-03-27): Improve error message for parametric polymorphic parameters which want to generate
+			// and enumerated array but cannot determine what it ought to be yet
+			if (ctx->allow_polymorphic_types && is_poly_type) {
+				return 0;
+			}
+
+			ERROR_BLOCK();
+
+			gbString s = expr_to_string(o->expr);
+			error(e, "Array count must be a constant integer, got %s", s);
+			gb_string_free(s);
+
+			if (is_poly_type) {
+				error_line("\tSuggestion: 'where' clause may be required to restrict the enumerated array index type to an enum\n");
+				error_line("\t            'where intrinsics.type_is_enum(%.*s)'\n", LIT(entity->token.string));
+			}
+
+			o->mode = Addressing_Invalid;
+			o->type = t_invalid;
+		}
+		return 0;
+	}
+	Type *type = core_type(o->type);
+	if (is_type_untyped(type) || is_type_integer(type)) {
+		ExactValue value = o->value;
+		if (value.kind == ExactValue_Float || value.kind == ExactValue_Rational) {
+			// NOTE: an integral float is a valid count, but it must be range checked as an integer
+			value = exact_value_to_integer(value);
+		}
+		if (value.kind == ExactValue_Integer) {
+			BigInt count = value.value_integer;
+			if (big_int_is_neg(&count)) {
+				gbAllocator a = heap_allocator();
+				String str = big_int_to_string(a, &count);
+				error(e, "Invalid negative array count, %.*s", LIT(str));
+				gb_free(a, str.text);
+				return 0;
+			}
+			switch (count.used) {
+			case 0: return 0;
+			case 1: return big_int_to_u64(&count);
+			}
+			gbAllocator a = heap_allocator();
+			String str = big_int_to_string(a, &count);
+			error(e, "Array count too large, %.*s", LIT(str));
+			gb_free(a, str.text);
+			return 0;
+		}
+	}
+
+	error(e, "Array count must be a constant integer");
+	return 0;
+}
+
+gb_internal Type *make_optional_ok_type(Type *value, bool typed) {
+	gbAllocator a = permanent_allocator();
+	Type *t = alloc_type_tuple();
+	slice_init(&t->Tuple.variables, a, 2);
+	t->Tuple.variables[0] = alloc_entity_field(nullptr, blank_token, value,  false, 0);
+	t->Tuple.variables[1] = alloc_entity_field(nullptr, blank_token, typed ? t_bool : t_untyped_bool, false, 1);
+	return t;
+}
+
+
+// IMPORTANT NOTE(bill): This must match the definition in dynamic_map_internal.odin
+enum : i64 {
+	MAP_CELL_CACHE_LINE_LOG2 = 6,
+	MAP_CELL_CACHE_LINE_SIZE = 1 << MAP_CELL_CACHE_LINE_LOG2,
+};
+GB_STATIC_ASSERT(MAP_CELL_CACHE_LINE_SIZE >= 64);
+gb_internal void map_cell_size_and_len(Type *type, i64 *size_, i64 *len_) {
+	i64 elem_sz = type_size_of(type);
+
+	i64 len = 1;
+	if (0 < elem_sz && elem_sz < MAP_CELL_CACHE_LINE_SIZE) {
+		len = MAP_CELL_CACHE_LINE_SIZE / elem_sz;
+	}
+	i64 size = align_formula(elem_sz * len, MAP_CELL_CACHE_LINE_SIZE);
+	if (size_) *size_ = size;
+	if (len_)  *len_ = len;
+}
+
+gb_internal Type *get_map_cell_type(Type *type) {
+	i64 size, len;
+	i64 elem_size = type_size_of(type);
+	map_cell_size_and_len(type, &size, &len);
+
+	if (size == len*elem_size) {
+		return type;
+	}
+
+	i64 padding = size - len*elem_size;
+	GB_ASSERT(padding > 0);
+
+	// Padding exists
+	Type *s = alloc_type_struct();
+	Scope *scope = create_scope(nullptr, nullptr);
+	s->Struct.fields = permanent_slice_make<Entity *>(2);
+	s->Struct.fields[0] = alloc_entity_field(scope, make_token_ident("v"), alloc_type_array(type, len), false, 0, EntityState_Resolved);
+	s->Struct.fields[1] = alloc_entity_field(scope, make_token_ident("_"), alloc_type_array(t_u8, padding), false, 1, EntityState_Resolved);
+	s->Struct.scope = scope;
+	wait_signal_set(&s->Struct.fields_wait_signal);
+	gb_unused(type_size_of(s));
+
+	return s;
+}
+
+gb_internal void init_map_internal_debug_types(Type *type) {
+	GB_ASSERT(type->kind == Type_Map);
+	GB_ASSERT(t_allocator != nullptr);
+	if (type->Map.debug_metadata_type != nullptr) {
+		return;
+	}
+
+	Type *key   = type->Map.key;
+	Type *value = type->Map.value;
+	GB_ASSERT(key != nullptr);
+	GB_ASSERT(value != nullptr);
+
+	Type *key_cell   = get_map_cell_type(key);
+	Type *value_cell = get_map_cell_type(value);
+
+	Type *metadata_type = alloc_type_struct();
+	Scope *metadata_scope = create_scope(nullptr, nullptr);
+	metadata_type->Struct.fields = permanent_slice_make<Entity *>(5);
+	metadata_type->Struct.fields[0] = alloc_entity_field(metadata_scope, make_token_ident("key"),    key,       false, 0, EntityState_Resolved);
+	metadata_type->Struct.fields[1] = alloc_entity_field(metadata_scope, make_token_ident("value"),  value,     false, 1, EntityState_Resolved);
+	metadata_type->Struct.fields[2] = alloc_entity_field(metadata_scope, make_token_ident("hash"),   t_uintptr, false, 2, EntityState_Resolved);
+	metadata_type->Struct.fields[3] = alloc_entity_field(metadata_scope, make_token_ident("key_cell"),   key_cell,   false, 3, EntityState_Resolved);
+	metadata_type->Struct.fields[4] = alloc_entity_field(metadata_scope, make_token_ident("value_cell"), value_cell, false, 4, EntityState_Resolved);
+	metadata_type->Struct.scope = metadata_scope;
+	metadata_type->Struct.node = nullptr;
+	wait_signal_set(&metadata_type->Struct.fields_wait_signal);
+
+	gb_unused(type_size_of(metadata_type));
+
+	// NOTE(bill): ^struct{key: Key, value: Value, hash: uintptr}
+	metadata_type = alloc_type_pointer(metadata_type);
+
+
+	Scope *scope = create_scope(nullptr, nullptr);
+	Type *debug_type = alloc_type_struct();
+	debug_type->Struct.fields = permanent_slice_make<Entity *>(3);
+	debug_type->Struct.fields[0] = alloc_entity_field(scope, make_token_ident("data"),       metadata_type, false, 0, EntityState_Resolved);
+	debug_type->Struct.fields[1] = alloc_entity_field(scope, make_token_ident("len"),        t_int,         false, 1, EntityState_Resolved);
+	debug_type->Struct.fields[2] = alloc_entity_field(scope, make_token_ident("allocator"),  t_allocator,   false, 2, EntityState_Resolved);
+	debug_type->Struct.scope = scope;
+	debug_type->Struct.node = nullptr;
+	wait_signal_set(&debug_type->Struct.fields_wait_signal);
+
+	gb_unused(type_size_of(debug_type));
+
+	type->Map.debug_metadata_type = debug_type;
+}
+
+
+gb_internal void init_map_internal_types(Type *type) {
+	GB_ASSERT(type->kind == Type_Map);
+	GB_ASSERT(t_allocator != nullptr);
+	if (type->Map.lookup_result_type != nullptr) {
+		return;
+	}
+
+	Type *key   = type->Map.key;
+	Type *value = type->Map.value;
+	GB_ASSERT(key != nullptr);
+	GB_ASSERT(value != nullptr);
+
+	type->Map.lookup_result_type = make_optional_ok_type(value);
+}
+
+gb_internal void add_map_key_type_dependencies(CheckerContext *ctx, Type *key) {
+	if (build_context.bedrock) {
+		// the map runtime is declared '#+build !bedrock'
+		return;
+	}
+
+	key = core_type(key);
+
+	if (is_type_cstring(key)) {
+		add_package_dependency(ctx, "runtime", "default_hasher_cstring");
+	} else if (is_type_cstring16(key)) {
+		add_package_dependency(ctx, "runtime", "default_hasher_cstring16");
+	} else if (is_type_string16(key)) {
+		add_package_dependency(ctx, "runtime", "default_hasher_string16");
+	} else if (is_type_string(key)) {
+		add_package_dependency(ctx, "runtime", "default_hasher_string");
+	} else if (!is_type_polymorphic(key)) {
+		if (!is_type_comparable(key)) {
+			return;
+		}
+
+		if (is_type_simple_compare(key)) {
+			add_package_dependency(ctx, "runtime", runtime_default_hasher_fixed_name(&ctx->checker->info));
+			return;
+		}
+
+		if (key->kind == Type_Basic) {
+			if (key->Basic.flags & BasicFlag_Quaternion) {
+				add_package_dependency(ctx, "runtime", "default_hasher_f64");
+				add_package_dependency(ctx, "runtime", "default_hasher_quaternion256");
+				return;
+			} else if (key->Basic.flags & BasicFlag_Complex) {
+				add_package_dependency(ctx, "runtime", "default_hasher_f64");
+				add_package_dependency(ctx, "runtime", "default_hasher_complex128");
+				return;
+			} else if (key->Basic.flags & BasicFlag_Float) {
+				add_package_dependency(ctx, "runtime", "default_hasher_f64");
+				return;
+			}
+		}
+
+		if (key->kind == Type_Struct) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			for_array(i, key->Struct.fields) {
+				Entity *field = key->Struct.fields[i];
+				add_map_key_type_dependencies(ctx, field->type);
+			}
+		} else if (key->kind == Type_Union) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			for_array(i, key->Union.variants) {
+				Type *v = key->Union.variants[i];
+				add_map_key_type_dependencies(ctx, v);
+			}
+		} else if (key->kind == Type_EnumeratedArray) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			add_map_key_type_dependencies(ctx, key->EnumeratedArray.elem);
+		} else if (key->kind == Type_Array) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			add_map_key_type_dependencies(ctx, key->Array.elem);
+		} else if (key->kind == Type_Matrix) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			add_map_key_type_dependencies(ctx, key->Matrix.elem);
+		} else if (key->kind == Type_SimdVector) {
+			add_package_dependency(ctx, "runtime", "default_hasher");
+			add_map_key_type_dependencies(ctx, key->SimdVector.elem);
+		}
+	}
+}
+
+gb_internal void check_map_type(CheckerContext *ctx, Type *type, Ast *node) {
+	GB_ASSERT(type->kind == Type_Map);
+	ast_node(mt, MapType, node);
+
+	if (mt->key == NULL) {
+		if (mt->value != NULL) {
+			Type *value = check_type(ctx, mt->value);
+			gbString str = type_to_string(value);
+			error(node, "Missing map key type, got 'map[]%s'", str);
+			gb_string_free(str);
+			return;
+		}
+		error(node, "Missing map key type, got 'map[]T'");
+		return;
+	}
+
+	Type *key   = check_type(ctx, mt->key);
+	Type *value = check_type(ctx, mt->value);
+
+	if (!is_type_valid_for_keys(key)) {
+		if (is_type_boolean(key)) {
+			error(node, "A boolean cannot be used as a key for a map, use an array instead for this case");
+		} else {
+			gbString str = type_to_string(key);
+			error(node, "Invalid type of a key for a map, got '%s'", str);
+			gb_string_free(str);
+		}
+	}
+	if (type_size_of(key) == 0) {
+		gbString str = type_to_string(key);
+		error(node, "Invalid type of a key for a map of size 0, got '%s'", str);
+		gb_string_free(str);
+	}
+
+	type->Map.key   = key;
+	type->Map.value = value;
+
+	add_map_key_type_dependencies(ctx, key);
+	add_comparison_procedures_for_fields(ctx, key);
+
+	init_core_map_type(ctx->checker);
+	init_map_internal_types(type);
+
+	if (build_context.bedrock) {
+		error(node, "'map' is not a valid type when using '-bedrock'");
+	}
+}
+
+gb_internal void check_matrix_type(CheckerContext *ctx, Type **type, Ast *node) {
+	ast_node(mt, MatrixType, node);
+
+	Operand row = {};
+	Operand column = {};
+
+	i64 row_count = check_array_count(ctx, &row, mt->row_count);
+	i64 column_count = check_array_count(ctx, &column, mt->column_count);
+
+	Type *generic_row = nullptr;
+	Type *generic_column = nullptr;
+
+	if (row.mode == Addressing_Type && row.type->kind == Type_Generic) {
+		generic_row = row.type;
+	}
+
+	if (column.mode == Addressing_Type && column.type->kind == Type_Generic) {
+		generic_column = column.type;
+	}
+
+	if (generic_row == nullptr && row_count < MATRIX_ELEMENT_COUNT_MIN) {
+		if (row.expr == nullptr) {
+			error(node, "Invalid matrix row count, got nothing");
+		} else {
+			gbString s = expr_to_string(row.expr);
+			error(row.expr, "Invalid matrix row count, expected %d+ rows, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
+			gb_string_free(s);
+		}
+	}
+
+	if (generic_column == nullptr && column_count < MATRIX_ELEMENT_COUNT_MIN) {
+		if (column.expr == nullptr) {
+			error(node, "Invalid matrix column count, got nothing");
+		} else {
+			gbString s = expr_to_string(column.expr);
+			error(column.expr, "Invalid matrix column count, expected %d+ columns, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
+			gb_string_free(s);
+		}
+	}
+
+	if (generic_row == nullptr && generic_column == nullptr) {
+		// row_count*column_count can overflow and wrap back under the limit, so test the
+		// dimensions first; each is at least MATRIX_ELEMENT_COUNT_MIN. Either one exceeding
+		// the maximum means the product does too
+		if (row_count > MATRIX_ELEMENT_COUNT_MAX || column_count > MATRIX_ELEMENT_COUNT_MAX ||
+		    row_count*column_count > MATRIX_ELEMENT_COUNT_MAX) {
+			// the element count is only printable when the multiply cannot overflow, which is
+			// exactly the case the dimension test above catches
+			if (row_count != 0 && column_count > I64_MAX/row_count) {
+				error(node, "Matrix types are limited to a maximum of %d elements, got %lld by %lld", MATRIX_ELEMENT_COUNT_MAX, cast(long long)row_count, cast(long long)column_count);
+			} else {
+				error(node, "Matrix types are limited to a maximum of %d elements, got %lld by %lld (%lld elements)", MATRIX_ELEMENT_COUNT_MAX, cast(long long)row_count, cast(long long)column_count, cast(long long)(row_count*column_count));
+			}
+		}
+	}
+
+
+	Type *elem = check_type_expr(ctx, mt->elem, nullptr);
+
+	// A `$T: typeid` param referenced by ident (e.g. proc($T: typeid) -> matrix[2,2]T) resolves to
+	// t_typeid; represent it as its Type_Generic so the element is properly polymorphic.
+	if (elem == t_typeid) {
+		Entity *e = entity_of_node(mt->elem);
+		if (e != nullptr && e->kind == Entity_TypeName && e->TypeName.is_type_alias) {
+			Type *gen = alloc_type_generic(ctx->scope, 0, entity_interned_name(e), nullptr);
+			gen->Generic.entity = e;
+			elem = gen;
+		}
+	}
+
+	if (!is_type_valid_for_matrix_elems(elem)) {
+		gbString s = type_to_string(elem);
+		error(column.expr, "Matrix elements types are limited to integers, floats, and complex, got %s", s);
+		gb_string_free(s);
+	}
+
+	*type = alloc_type_matrix(elem, row_count, column_count, generic_row, generic_column, mt->is_row_major);
+
+	return;
+}
+
+struct SoaTypeWorkerData {
+	CheckerContext ctx;
+	Type *         type;
+	bool           wait_to_finish;
+};
+
+
+gb_internal bool complete_soa_type(Checker *checker, Type *t, bool wait_to_finish) {
+	Type *original_type = t;
+	gb_unused(original_type);
+
+	t = base_type(t);
+	if (t == nullptr || !is_type_soa_struct(t)) {
+		return true;
+	}
+
+	MUTEX_GUARD(&t->Struct.soa_mutex);
+
+	if (t->Struct.fields_wait_signal.futex.load()) {
+		return true;
+	}
+
+	isize field_count = 0;
+	i32 extra_field_count = 0;
+	switch (t->Struct.soa_kind) {
+	case StructSoa_Fixed:	extra_field_count = 0; break;
+	case StructSoa_Slice:	extra_field_count = 1; break;
+	case StructSoa_Dynamic:	extra_field_count = 3; break;
+	}
+
+	Scope *scope = t->Struct.scope;
+	i64 soa_count = t->Struct.soa_count;
+	Type *elem = t->Struct.soa_elem;
+	Type *old_struct = base_type(elem);
+	GB_ASSERT(old_struct->kind == Type_Struct);
+
+	if (wait_to_finish) {
+		wait_for_record_signal(&old_struct->Struct.fields_wait_signal, &old_struct->Struct.checking_thread);
+	} else {
+		GB_ASSERT(old_struct->Struct.fields_wait_signal.futex.load() != 0);
+	}
+
+	field_count = old_struct->Struct.fields.count;
+
+	t->Struct.fields = permanent_slice_make<Entity *>(field_count+extra_field_count);
+	t->Struct.tags = permanent_alloc_array<String>(field_count+extra_field_count);
+
+
+	auto const &add_entity = [](Scope *scope, Entity *entity) {
+		String name = entity->token.string;
+		if (!is_blank_ident(name)) {
+			Entity *ie = scope_insert(scope, entity);
+			if (ie != nullptr) {
+				redeclaration_error(name, entity, ie);
+			}
+		}
+	};
+
+
+	for_array(i, old_struct->Struct.fields) {
+		Entity *old_field = old_struct->Struct.fields[i];
+		if (old_field->kind == Entity_Variable) {
+			Type *field_type = nullptr;
+			if (t->Struct.soa_kind == StructSoa_Fixed) {
+				GB_ASSERT(soa_count >= 0);
+				field_type = alloc_type_array(old_field->type, soa_count);
+			} else {
+				field_type = alloc_type_multi_pointer(old_field->type);
+			}
+			Entity *new_field = alloc_entity_field(scope, old_field->token, field_type, false, old_field->Variable.field_index);
+			t->Struct.fields[i] = new_field;
+			add_entity(scope, new_field);
+			new_field->flags |= EntityFlag_Used;
+			if (t->Struct.soa_kind != StructSoa_Fixed) {
+				new_field->flags |= EntityFlag_SoaPtrField;
+			}
+		} else {
+			t->Struct.fields[i] = old_field;
+		}
+
+		t->Struct.tags[i] = old_struct->Struct.tags[i];
+	}
+
+	if (t->Struct.soa_kind != StructSoa_Fixed) {
+		Entity *len_field = alloc_entity_field(scope, make_token_ident("__$len"), t_int, false, cast(i32)field_count+0);
+		t->Struct.fields[field_count+0] = len_field;
+		add_entity(scope, len_field);
+			len_field->flags |= EntityFlag_Used;
+
+		if (t->Struct.soa_kind == StructSoa_Dynamic) {
+			Entity *cap_field = alloc_entity_field(scope, make_token_ident("__$cap"), t_int, false, cast(i32)field_count+1);
+			t->Struct.fields[field_count+1] = cap_field;
+			add_entity(scope, cap_field);
+			cap_field->flags |= EntityFlag_Used;
+
+			init_mem_allocator(checker);
+			Entity *allocator_field = alloc_entity_field(scope, make_token_ident("allocator"), t_allocator, false, cast(i32)field_count+2);
+			t->Struct.fields[field_count+2] = allocator_field;
+			add_entity(scope, allocator_field);
+			allocator_field->flags |= EntityFlag_Used;
+		}
+	}
+
+	// add_type_info_type(ctx, original_type);
+
+	wait_signal_set(&t->Struct.fields_wait_signal);
+	return true;
+}
+
+gb_internal WORKER_TASK_PROC(complete_soa_type_worker) {
+	SoaTypeWorkerData *wd = cast(SoaTypeWorkerData *)data;
+	complete_soa_type(wd->ctx.checker, wd->type, wd->wait_to_finish);
+	return 0;
+}
+
+
+
+gb_internal Type *make_soa_struct_internal(CheckerContext *ctx, Ast *array_typ_expr, Ast *elem_expr, Type *elem, i64 count, Type *generic_type, StructSoaKind soa_kind) {
+	Type *bt_elem = base_type(elem);
+
+	bool is_polymorphic = is_type_polymorphic(elem);
+
+	if (!is_polymorphic && !is_type_struct(elem) && !is_type_raw_union(elem) && !(is_type_array(elem) && bt_elem->Array.count <= 4)) {
+		gbString str = type_to_string(elem);
+		error(elem_expr, "Invalid type for an #soa array, expected a struct or array of length 4 or below, got '%s'", str);
+		gb_string_free(str);
+		return alloc_type_array(elem, count, generic_type);
+	}
+
+	Type * soa_struct  = nullptr;
+	Scope *scope       = nullptr;
+	bool   is_complete = false;
+
+	isize field_count = 0;
+	i32 extra_field_count = 0;
+	switch (soa_kind) {
+	case StructSoa_Fixed:	extra_field_count = 0; break;
+	case StructSoa_Slice:	extra_field_count = 1; break;
+	case StructSoa_Dynamic:	extra_field_count = 3; break;
+	}
+
+	soa_struct = alloc_type_struct();
+	soa_struct->Struct.soa_kind = soa_kind;
+	soa_struct->Struct.soa_elem = elem;
+	soa_struct->Struct.is_polymorphic = is_polymorphic;
+	soa_struct->Struct.node = array_typ_expr;
+
+	if (count > I32_MAX) {
+		count = I32_MAX;
+		error(array_typ_expr, "Array count too large for an #soa struct, got %lld", cast(long long)count);
+	}
+	soa_struct->Struct.soa_count = cast(i32)count;
+
+	scope = create_scope(ctx->info, ctx->scope);
+	soa_struct->Struct.scope = scope;
+
+	if (elem && elem->kind == Type_Named) {
+		add_declaration_dependency(ctx, elem->Named.type_name);
+	}
+
+	if (is_polymorphic) {
+		field_count = 0;
+
+		soa_struct->Struct.fields = permanent_slice_make<Entity *>(field_count+extra_field_count);
+		soa_struct->Struct.tags = gb_alloc_array(permanent_allocator(), String, field_count+extra_field_count);
+		soa_struct->Struct.soa_count = 0;
+
+		is_complete = true;
+
+	} else if (is_type_array(elem)) {
+		Type *old_array = base_type(elem);
+		field_count = cast(isize)old_array->Array.count;
+
+		soa_struct->Struct.fields = permanent_slice_make<Entity *>(field_count+extra_field_count);
+		soa_struct->Struct.tags = gb_alloc_array(permanent_allocator(), String, field_count+extra_field_count);
+
+		String params_xyzw[4] = {
+			str_lit("x"),
+			str_lit("y"),
+			str_lit("z"),
+			str_lit("w")
+		};
+
+		for (isize i = 0; i < cast(isize)old_array->Array.count; i++) {
+			Type *field_type = nullptr;
+			if (soa_kind == StructSoa_Fixed) {
+				GB_ASSERT(count >= 0);
+				field_type = alloc_type_array(old_array->Array.elem, count);
+			} else {
+				field_type = alloc_type_multi_pointer(old_array->Array.elem);
+			}
+			Token token = {};
+			token.string = params_xyzw[i];
+
+			Entity *new_field = alloc_entity_field(scope, token, field_type, false, cast(i32)i);
+			soa_struct->Struct.fields[i] = new_field;
+			add_entity(ctx, scope, nullptr, new_field);
+			add_entity_use(ctx, nullptr, new_field);
+			if (soa_kind != StructSoa_Fixed) {
+				new_field->flags |= EntityFlag_SoaPtrField;
+			}
+		}
+
+		is_complete = true;
+
+	} else {
+		GB_ASSERT(is_type_struct(elem));
+
+		Type *old_struct = base_type(elem);
+
+		if (old_struct->Struct.fields_wait_signal.futex.load()) {
+			field_count = old_struct->Struct.fields.count;
+
+			soa_struct->Struct.fields = permanent_slice_make<Entity *>(field_count+extra_field_count);
+			soa_struct->Struct.tags = permanent_alloc_array<String>(field_count+extra_field_count);
+
+			for_array(i, old_struct->Struct.fields) {
+				Entity *old_field = old_struct->Struct.fields[i];
+				if (old_field->kind == Entity_Variable) {
+					Type *field_type = nullptr;
+					if (soa_kind == StructSoa_Fixed) {
+						GB_ASSERT(count >= 0);
+						field_type = alloc_type_array(old_field->type, count);
+					} else {
+						field_type = alloc_type_multi_pointer(old_field->type);
+					}
+					Entity *new_field = alloc_entity_field(scope, old_field->token, field_type, false, old_field->Variable.field_index);
+					soa_struct->Struct.fields[i] = new_field;
+					add_entity(ctx, scope, nullptr, new_field);
+					add_entity_use(ctx, nullptr, new_field);
+					if (soa_kind != StructSoa_Fixed) {
+						new_field->flags |= EntityFlag_SoaPtrField;
+					}
+				} else {
+					soa_struct->Struct.fields[i] = old_field;
+				}
+
+				soa_struct->Struct.tags[i] = old_struct->Struct.tags[i];
+			}
+			is_complete = true;
+		}
+	}
+
+	if (is_complete && soa_kind != StructSoa_Fixed) {
+		Entity *len_field = alloc_entity_field(scope, make_token_ident("__$len"), t_int, false, cast(i32)field_count+0);
+		soa_struct->Struct.fields[field_count+0] = len_field;
+		add_entity(ctx, scope, nullptr, len_field);
+		add_entity_use(ctx, nullptr, len_field);
+
+		if (soa_kind == StructSoa_Dynamic) {
+			Entity *cap_field = alloc_entity_field(scope, make_token_ident("__$cap"), t_int, false, cast(i32)field_count+1);
+			soa_struct->Struct.fields[field_count+1] = cap_field;
+			add_entity(ctx, scope, nullptr, cap_field);
+			add_entity_use(ctx, nullptr, cap_field);
+
+			init_mem_allocator(ctx->checker);
+			Entity *allocator_field = alloc_entity_field(scope, make_token_ident("allocator"), t_allocator, false, cast(i32)field_count+2);
+			soa_struct->Struct.fields[field_count+2] = allocator_field;
+			add_entity(ctx, scope, nullptr, allocator_field);
+			add_entity_use(ctx, nullptr, allocator_field);
+		}
+	}
+
+	Token token = {};
+	token.string = str_lit("Base_Type");
+	Entity *base_type_entity = alloc_entity_type_name(scope, token, elem, EntityState_Resolved);
+	add_entity(ctx, scope, nullptr, base_type_entity);
+
+	if (is_complete) {
+		add_type_info_type(ctx, soa_struct);
+		wait_signal_set(&soa_struct->Struct.fields_wait_signal);
+	} else if (global_group_context.soa_types != nullptr) {
+		// NOTE: no task waits on the element type, which could hold every thread of the pool
+		array_add(global_group_context.soa_types, soa_struct);
+	} else {
+		SoaTypeWorkerData *wd = permanent_alloc_item<SoaTypeWorkerData>();
+		wd->ctx = *ctx;
+		wd->type = soa_struct;
+		wd->wait_to_finish = true;
+
+		mpsc_enqueue(&ctx->checker->soa_types_to_complete, soa_struct);
+		thread_pool_add_task(complete_soa_type_worker, wd);
+	}
+
+	return soa_struct;
+}
+
+
+gb_internal Type *make_soa_struct_fixed(CheckerContext *ctx, Ast *array_typ_expr, Ast *elem_expr, Type *elem, i64 count, Type *generic_type) {
+	return make_soa_struct_internal(ctx, array_typ_expr, elem_expr, elem, count, generic_type, StructSoa_Fixed);
+}
+
+gb_internal Type *make_soa_struct_slice(CheckerContext *ctx, Ast *array_typ_expr, Ast *elem_expr, Type *elem) {
+	return make_soa_struct_internal(ctx, array_typ_expr, elem_expr, elem, -1, nullptr, StructSoa_Slice);
+}
+
+
+gb_internal Type *make_soa_struct_dynamic_array(CheckerContext *ctx, Ast *array_typ_expr, Ast *elem_expr, Type *elem) {
+	return make_soa_struct_internal(ctx, array_typ_expr, elem_expr, elem, -1, nullptr, StructSoa_Dynamic);
+}
+
+gb_internal void check_array_type_internal(CheckerContext *ctx, Ast *e, Type **type, Type *named_type) {
+	ast_node(at, ArrayType, e);
+	if (at->count != nullptr) {
+		Operand o = {};
+		i64 count = check_array_count(ctx, &o, at->count);
+		Type *generic_type = nullptr;
+
+		Type *elem = check_type_expr(ctx, at->elem, nullptr);
+
+		if (o.mode == Addressing_Type && o.type->kind == Type_Generic) {
+			generic_type = o.type;
+		} else if (o.mode == Addressing_Type && is_type_enum(o.type)) {
+			Type *index = o.type;
+			Type *bt = base_type(index);
+			GB_ASSERT(bt->kind == Type_Enum);
+
+			// the length is `max - min + 1`, computed exactly and then narrowed to an i64. a
+			// wide enough enumeration wraps & nothing tests downstream; reject here
+			if (bt->Enum.fields.count > 0 &&
+			    bt->Enum.min_value != nullptr && bt->Enum.max_value != nullptr) {
+				ExactValue span = exact_value_sub(*bt->Enum.max_value, *bt->Enum.min_value);
+				ExactValue len  = exact_value_add(span, exact_value_i64(1));
+				if (len.kind == ExactValue_Integer && len.value_integer.used > 1) {
+					gbAllocator a = heap_allocator();
+					String str = big_int_to_string(a, &len.value_integer);
+					error(e, "Enumerated array length too large, %.*s", LIT(str));
+					gb_free(a, str.text);
+					*type = t_invalid;
+					return;
+				}
+			}
+
+			Type *t = alloc_type_enumerated_array(elem, index, bt->Enum.min_value, bt->Enum.max_value, bt->Enum.fields.count, Token_Invalid);
+
+			bool is_sparse = false;
+			if (at->tag != nullptr) {
+				GB_ASSERT(at->tag->kind == Ast_BasicDirective);
+				String name = at->tag->BasicDirective.name.string;
+				if (name == "sparse") {
+					is_sparse = true;
+				} else {
+					error(at->tag, "Invalid tag applied to an enumerated array, got #%.*s", LIT(name));
+				}
+			}
+
+			if (!is_sparse && t->EnumeratedArray.count > bt->Enum.fields.count) {
+				ERROR_BLOCK();
+
+				error(e, "Non-contiguous enumeration used as an index in an enumerated array");
+				long long ea_count   = cast(long long)t->EnumeratedArray.count;
+				long long enum_count = cast(long long)bt->Enum.fields.count;
+				error_line("\tenumerated array length: %lld\n", ea_count);
+				error_line("\tenum field count: %lld\n", enum_count);
+				error_line("\tSuggestion: prepend #sparse to the enumerated array to allow for non-contiguous elements\n");
+				if (2*enum_count < ea_count) {
+					error_line("\tWarning: the number of named elements is much smaller than the length of the array, are you sure this is what you want?\n");
+					error_line("\t         this warning will be removed if #sparse is applied\n");
+				}
+			}
+			t->EnumeratedArray.is_sparse = is_sparse;
+
+			*type = t;
+
+			return;
+		}
+
+		// Track user input and recovery value seperate, since both could be '0'
+		bool count_recovered = false;
+		if (count < 0) {
+			error(at->count, "? can only be used in conjunction with compound literals");
+			count = 0;
+			count_recovered = true;
+		}
+
+
+		if (at->tag != nullptr) {
+			GB_ASSERT(at->tag->kind == Ast_BasicDirective);
+			String name = at->tag->BasicDirective.name.string;
+			if (name == "soa") {
+				*type = make_soa_struct_fixed(ctx, e, at->elem, elem, count, generic_type);
+			} else if (name == "simd") {
+				if (!is_type_valid_vector_elem(elem) && !is_type_polymorphic(elem)) {
+					gbString str = type_to_string(elem);
+					error(at->elem, "Invalid element type for #simd, expected an integer, float, boolean, or 'rawptr' with no specific endianness, got '%s'", str);
+					gb_string_free(str);
+					*type = alloc_type_array(elem, count, generic_type);
+					return;
+				}
+
+				if (generic_type != nullptr) {
+					// Ignore
+				} else if (count < 1 || !is_power_of_two(count)) {
+					*type = alloc_type_array(elem, count, generic_type);
+					if (count_recovered) {
+						return;
+					}
+					// a polymorphic value used as the count is still unresolved while the
+					// signature is checked and reads as 0; only a written count is constant
+					if (ctx->disallow_polymorphic_return_types && o.mode != Addressing_Constant) {
+						return;
+					}
+					error(at->count, "Invalid length for #simd, expected a power of two length, got '%lld'", cast(long long)count);
+					return;
+				}
+
+				*type = alloc_type_simd_vector(count, elem, generic_type);
+
+				if (count > SIMD_ELEMENT_COUNT_MAX) {
+					error(at->count, "#simd support a maximum element count of %d, got %lld", SIMD_ELEMENT_COUNT_MAX, cast(long long)count);
+				}
+			} else {
+				error(at->tag, "Invalid tag applied to array, got #%.*s", LIT(name));
+				*type = alloc_type_array(elem, count, generic_type);
+			}
+		} else {
+			*type = alloc_type_array(elem, count, generic_type);
+		}
+	} else {
+		Type *elem = check_type(ctx, at->elem);
+
+		if (at->tag != nullptr) {
+			GB_ASSERT(at->tag->kind == Ast_BasicDirective);
+			String name = at->tag->BasicDirective.name.string;
+			if (name == "soa") {
+				*type = make_soa_struct_slice(ctx, e, at->elem, elem);
+			} else {
+				error(at->tag, "Invalid tag applied to array, got #%.*s", LIT(name));
+				*type = alloc_type_slice(elem);
+			}
+		} else {
+			*type = alloc_type_slice(elem);
+		}
+	}
+}
+gb_internal bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, Type *named_type) {
+	GB_ASSERT(type != nullptr);
+	if (e == nullptr) {
+		*type = t_invalid;
+		return true;
+	}
+
+	switch (e->kind) {
+	case_ast_node(i, Ident, e);
+		Operand o = {};
+		Entity *entity = check_ident(ctx, &o, e, named_type, nullptr, false);
+		gb_unused(entity);
+
+		gbString err_str = nullptr;
+		defer (gb_string_free(err_str));
+
+		switch (o.mode) {
+		case Addressing_Invalid:
+			break;
+		case Addressing_Type: {
+			*type = o.type;
+			if (!ctx->in_polymorphic_specialization) {
+				Type *t = base_type(o.type);
+				if (t != nullptr && is_type_polymorphic_record_unspecialized(t)) {
+					err_str = expr_to_string(e);
+					error(e, "Invalid use of a non-specialized polymorphic type '%s'", err_str);
+					return true;
+				}
+			}
+			return true;
+		}
+
+		case Addressing_NoValue:
+			err_str = expr_to_string(e);
+			error(e, "'%s' used as a type", err_str);
+			break;
+
+		default:
+			err_str = expr_to_string(e);
+			error(e, "'%s' used as a type when not a type", err_str);
+			break;
+		}
+	case_end;
+
+	case_ast_node(ht, HelperType, e);
+		return check_type_internal(ctx, ht->type, type, named_type);
+	case_end;
+
+	case_ast_node(dt, DistinctType, e);
+		error(e, "Invalid use of a distinct type");
+		// NOTE(bill): Treat it as a HelperType to remove errors
+		return check_type_internal(ctx, dt->type, type, named_type);
+	case_end;
+
+	case_ast_node(tt, TypeidType, e);
+		e->tav.mode = Addressing_Type;
+		e->tav.type = t_typeid;
+		*type = t_typeid;
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(pt, PolyType, e);
+		Ast *ident = pt->type;
+		if (ident->kind != Ast_Ident) {
+			error(ident, "Expected an identifier after the $");
+			*type = t_invalid;
+			return false;
+		}
+
+		Token token = ident->Ident.token;
+		Type *specific = nullptr;
+		if (pt->specialization != nullptr) {
+			CheckerContext c = *ctx;
+			c.in_polymorphic_specialization = true;
+
+			Ast *s = pt->specialization;
+			specific = check_type(&c, s);
+		}
+		Type *t = alloc_type_generic(ctx->scope, 0, ident->Ident.interned, specific);
+		if (ctx->allow_polymorphic_types) {
+			if (ctx->disallow_polymorphic_return_types) {
+				error(ident, "Undeclared polymorphic parameter '%.*s' in return type", LIT(token.string));
+			}
+			Scope *ps = ctx->polymorphic_scope;
+			Scope *s = ctx->scope;
+			Scope *entity_scope = s;
+			if (ps != nullptr && ps != s) {
+				// TODO(bill): Is this check needed?
+				// GB_ASSERT_MSG(is_scope_an_ancestor(ps, s) >= 0);
+				entity_scope = ps;
+			}
+			Entity *e = alloc_entity_type_name(entity_scope, token, t);
+			t->Generic.entity = e;
+			e->TypeName.is_type_alias = true;
+			e->state = EntityState_Resolved;
+			add_entity(ctx, ps, ident, e);
+			add_entity(ctx, s, ident, e);
+		} else {
+			error(ident, "Invalid use of a polymorphic parameter '$%.*s'", LIT(token.string));
+			*type = t_invalid;
+			return false;
+		}
+		*type = t;
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(se, SelectorExpr, e);
+		Operand o = {};
+		check_selector(ctx, &o, e, nullptr);
+
+		gbString err_str;
+		switch (o.mode) {
+		case Addressing_Invalid:
+			break;
+		case Addressing_Type:
+			GB_ASSERT(o.type != nullptr);
+			*type = o.type;
+			return true;
+		case Addressing_NoValue:
+			err_str = expr_to_string(e);
+			error(e, "'%s' used as a type", err_str);
+			gb_string_free(err_str);
+			break;
+		default:
+			err_str = expr_to_string(e);
+			error(e, "'%s' is not a type", err_str);
+			gb_string_free(err_str);
+			break;
+		}
+	case_end;
+
+	case_ast_node(pe, ParenExpr, e);
+		if (pe->expr == nullptr) {
+			error(e, "Expected an expression or type within the parentheses");
+			*type = t_invalid;
+			return true;
+		}
+		*type = check_type_expr(ctx, pe->expr, named_type);
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(ue, UnaryExpr, e);
+		switch (ue->op.kind) {
+		case Token_Pointer:
+			{
+				Type *elem = check_type(ctx, ue->expr);
+				*type = alloc_type_pointer(elem);
+				set_base_type(named_type, *type);
+				return true;
+			}
+		}
+	case_end;
+
+	case_ast_node(pt, PointerType, e);
+		CheckerContext c = *ctx;
+
+		TEMPORARY_ALLOCATOR_GUARD();
+		c.type_path = new_checker_type_path();
+		defer (destroy_checker_type_path(c.type_path));
+
+		Type *elem = t_invalid;
+		Operand o = {};
+
+		if (unparen_expr(pt->type) == nullptr) {
+			error(e, "Invalid pointer type");
+			return false;
+		}
+
+		check_expr_or_type(&c, &o, pt->type);
+		if (o.mode != Addressing_Invalid && o.mode != Addressing_Type) {
+			if (o.mode == Addressing_Variable) {
+				gbString s = expr_to_string(pt->type);
+				error(e, "^ is used for pointer types, did you mean '&%s'?", s);
+				gb_string_free(s);
+			} else if (is_type_pointer(o.type)) {
+				gbString s = expr_to_string(pt->type);
+				error(e, "^ is used for pointer types, did you mean a dereference: '%s^'?", s);
+				gb_string_free(s);
+			} else {
+				// NOTE(bill): call check_type_expr again to get a consistent error message
+				elem = check_type_expr(&c, pt->type, nullptr);
+			}
+		} else {
+			elem = o.type;
+		}
+
+		if (!ctx->in_polymorphic_specialization && ctx->disallow_polymorphic_return_types) {
+			Type *t = base_type(elem);
+			if (t != nullptr &&
+			    unparen_expr(pt->type)->kind == Ast_Ident &&
+			    is_type_polymorphic_record_unspecialized(t)) {
+				gbString err_str = expr_to_string(e);
+				error(e, "Invalid use of a non-specialized polymorphic type '%s'", err_str);
+				gb_string_free(err_str);
+			}
+		}
+
+
+		if (pt->tag != nullptr) {
+			GB_ASSERT(pt->tag->kind == Ast_BasicDirective);
+			String name = pt->tag->BasicDirective.name.string;
+			if (name == "soa") {
+				// TODO(bill): generic #soa pointers
+				if (is_type_soa_struct(elem)) {
+					*type = alloc_type_soa_pointer(elem);
+				} else {
+					error(pt->tag, "#soa pointers require an #soa record type as the element");
+					*type = alloc_type_pointer(elem);
+				}
+			} else {
+				error(pt->tag, "Invalid tag applied to pointer, got #%.*s", LIT(name));
+				*type = alloc_type_pointer(elem);
+			}
+		} else {
+			*type = alloc_type_pointer(elem);
+		}
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(pt, MultiPointerType, e);
+		*type = alloc_type_multi_pointer(check_type(ctx, pt->type));
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(rt, RelativeType, e);
+		error(e, "#relative types have been removed from the compiler. Prefer \"core:relative\".");
+		*type = t_invalid;
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(at, ArrayType, e);
+		check_array_type_internal(ctx, e, type, named_type);
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(dat, DynamicArrayType, e);
+		Type *elem = check_type(ctx, dat->elem);
+		if (dat->tag != nullptr) {
+			GB_ASSERT(dat->tag->kind == Ast_BasicDirective);
+			String name = dat->tag->BasicDirective.name.string;
+			if (name == "soa") {
+				*type = make_soa_struct_dynamic_array(ctx, e, dat->elem, elem);
+			} else {
+				error(dat->tag, "Invalid tag applied to dynamic array, got #%.*s", LIT(name));
+				*type = alloc_type_dynamic_array(elem);
+			}
+		} else {
+			*type = alloc_type_dynamic_array(elem);
+		}
+		set_base_type(named_type, *type);
+
+		return true;
+	case_end;
+
+	case_ast_node(dat, FixedCapacityDynamicArrayType, e);
+		Operand o = {};
+		i64 capacity = check_array_count(ctx, &o, dat->capacity);
+		Type *generic_type = nullptr;
+		if (o.mode == Addressing_Type && o.type->kind == Type_Generic) {
+			generic_type = o.type;
+		}
+
+		if (capacity < 0) {
+			error(dat->capacity, "? can only be used in conjunction with compound literals of fixed-length arrays");
+			capacity = 0;
+		}
+
+
+		Type *elem = check_type(ctx, dat->elem);
+		if (dat->tag != nullptr) {
+			GB_ASSERT(dat->tag->kind == Ast_BasicDirective);
+			String name = dat->tag->BasicDirective.name.string;
+			error(dat->tag, "Invalid tag applied to fixed capacity dynamic array, got #%.*s", LIT(name));
+		}
+		*type = alloc_type_fixed_capacity_dynamic_array(elem, capacity, generic_type);
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(st, StructType, e);
+		CheckerContext c = *ctx;
+		c.in_polymorphic_specialization = false;
+		c.type_level += 1;
+
+		*type = alloc_type_struct();
+		set_base_type(named_type, *type);
+		check_open_scope(&c, e);
+		check_struct_type(&c, *type, e, nullptr, named_type);
+		check_close_scope(&c);
+		(*type)->Struct.node = e;
+		return true;
+	case_end;
+
+	case_ast_node(ut, UnionType, e);
+		CheckerContext c = *ctx;
+		c.in_polymorphic_specialization = false;
+		c.type_level += 1;
+
+		*type = alloc_type_union();
+		set_base_type(named_type, *type);
+		check_open_scope(&c, e);
+		check_union_type(&c, *type, e, nullptr, named_type);
+		check_close_scope(&c);
+		(*type)->Union.node = e;
+		return true;
+	case_end;
+
+	case_ast_node(et, EnumType, e);
+		bool ips = ctx->in_polymorphic_specialization;
+		defer (ctx->in_polymorphic_specialization = ips);
+		ctx->in_polymorphic_specialization = false;
+		ctx->in_enum_type = true;
+
+		*type = alloc_type_enum();
+		set_base_type(named_type, *type);
+		check_open_scope(ctx, e);
+		check_enum_type(ctx, *type, named_type, e);
+		check_close_scope(ctx);
+		(*type)->Enum.node = e;
+
+		ctx->in_enum_type = false;
+		return true;
+	case_end;
+
+	case_ast_node(bs, BitSetType, e);
+		*type = alloc_type_bit_set();
+		set_base_type(named_type, *type);
+		check_bit_set_type(ctx, *type, named_type, e);
+		return true;
+	case_end;
+
+	case_ast_node(bf, BitFieldType, e);
+		bool ips = ctx->in_polymorphic_specialization;
+		defer (ctx->in_polymorphic_specialization = ips);
+		ctx->in_polymorphic_specialization = false;
+
+		*type = alloc_type_bit_field();
+		set_base_type(named_type, *type);
+		check_open_scope(ctx, e);
+		check_bit_field_type(ctx, *type, named_type, e);
+		check_close_scope(ctx);
+		(*type)->BitField.node = e;
+		return true;
+	case_end;
+
+
+	case_ast_node(pt, ProcType, e);
+		bool ips = ctx->in_polymorphic_specialization;
+		defer (ctx->in_polymorphic_specialization = ips);
+		ctx->in_polymorphic_specialization = false;
+
+		*type = alloc_type(Type_Proc);
+		set_base_type(named_type, *type);
+		check_open_scope(ctx, e);
+		check_procedure_type(ctx, *type, e);
+		check_close_scope(ctx);
+		return true;
+	case_end;
+
+	case_ast_node(mt, MapType, e);
+		bool ips = ctx->in_polymorphic_specialization;
+		defer (ctx->in_polymorphic_specialization = ips);
+		ctx->in_polymorphic_specialization = false;
+
+		*type = alloc_type(Type_Map);
+		set_base_type(named_type, *type);
+		check_map_type(ctx, *type, e);
+		return true;
+	case_end;
+
+	case_ast_node(ce, CallExpr, e);
+		Operand o = {};
+		check_expr_or_type(ctx, &o, e);
+		if (o.mode == Addressing_Type) {
+			*type = o.type;
+			set_base_type(named_type, *type);
+			return true;
+		}
+	case_end;
+
+	case_ast_node(te, TernaryIfExpr, e);
+		Operand o = {};
+		check_expr_or_type(ctx, &o, e);
+		if (o.mode == Addressing_Type) {
+			*type = o.type;
+			set_base_type(named_type, *type);
+			return true;
+		}
+	case_end;
+
+	case_ast_node(te, TernaryWhenExpr, e);
+		Operand o = {};
+		check_expr_or_type(ctx, &o, e);
+		if (o.mode == Addressing_Type) {
+			*type = o.type;
+			set_base_type(named_type, *type);
+			return true;
+		}
+	case_end;
+
+
+	case_ast_node(mt, MatrixType, e);
+		check_matrix_type(ctx, type, e);
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	default: {
+		Operand	o = {};
+		check_expr_base(ctx, &o, e, nullptr);
+
+		if (o.mode == Addressing_Constant &&
+		    o.value.kind == ExactValue_Typeid) {
+			Type *t = o.value.value_typeid;
+			if (t != nullptr && t != t_invalid) {
+				*type = t;
+				return true;
+			}
+		}
+	}
+	}
+
+	*type = t_invalid;
+	return false;
+}
+
+gb_internal Type *check_type(CheckerContext *ctx, Ast *e) {
+	CheckerContext c = *ctx;
+	c.type_path = new_checker_type_path();
+	defer (destroy_checker_type_path(c.type_path));
+
+	return check_type_expr(&c, e, nullptr);
+}
+
+gb_internal Type *check_type_expr(CheckerContext *ctx, Ast *e, Type *named_type) {
+	Type *type = nullptr;
+	bool ok = check_type_internal(ctx, e, &type, named_type);
+
+	if (!ok) {
+		gbString err_str = expr_to_string(e);
+		defer (gb_string_free(err_str));
+
+		begin_error_block();
+		error(e, "'%s' is not a type", err_str);
+
+		type = t_invalid;
+
+
+		// NOTE(bill): Check for common mistakes from C programmers
+		// e.g. T[] and T[N]
+		// e.g. *T
+		Ast *node = unparen_expr(e);
+		if (node && node->kind == Ast_IndexExpr) {
+			gbString index_str = nullptr;
+			if (node->IndexExpr.index) {
+				index_str = expr_to_string(node->IndexExpr.index);
+			}
+			defer (gb_string_free(index_str));
+
+			gbString type_str = expr_to_string(node->IndexExpr.expr);
+			defer (gb_string_free(type_str));
+
+			error_line("\tSuggestion: Did you mean '[%s]%s'?\n", index_str ? index_str : "", type_str);
+			end_error_block();
+
+			// NOTE(bill): Minimize error propagation of bad array syntax by treating this like a type
+			if (node->IndexExpr.expr != nullptr) {
+				Ast *pseudo_array_expr = ast_array_type(e->file(), ast_token(node->IndexExpr.expr), node->IndexExpr.index, node->IndexExpr.expr);
+				check_array_type_internal(ctx, pseudo_array_expr, &type, nullptr);
+			}
+		} else if (node && node->kind == Ast_UnaryExpr && node->UnaryExpr.op.kind == Token_Mul) {
+			gbString type_str = expr_to_string(node->UnaryExpr.expr);
+			defer (gb_string_free(type_str));
+
+			error_line("\tSuggestion: Did you mean '^%s'?\n", type_str);
+			end_error_block();
+
+			// NOTE(bill): Minimize error propagation of bad array syntax by treating this like a type
+			if (node->UnaryExpr.expr != nullptr) {
+				Ast *pseudo_pointer_expr = ast_pointer_type(e->file(), ast_token(node->UnaryExpr.expr), node->UnaryExpr.expr);
+				return check_type_expr(ctx, pseudo_pointer_expr, named_type);
+			}
+		} else {
+			end_error_block();
+		}
+	}
+
+	if (type == nullptr) {
+		type = t_invalid;
+	}
+
+	if (type->kind == Type_Named &&
+	    type->Named.base == nullptr) {
+		// IMPORTANT TODO(bill): Is this a serious error?!
+		#if 0
+		error(e, "Invalid type definition of '%.*s'", LIT(type->Named.name));
+		#endif
+		if (type->Named.type_name->TypeName.is_type_alias) {
+			// NOTE(laytan): keep it null, type declaration is a mini "cycle" to be filled later.
+		} else {
+			type->Named.base = t_invalid;
+		}
+	}
+
+	if (is_type_polymorphic(type)) {
+		type->flags |= TypeFlag_Polymorphic;
+	} else if (is_type_polymorphic(type, true)) {
+		type->flags |= TypeFlag_PolySpecialized;
+	}
+
+	#if 0
+	if (!ctx->allow_polymorphic_types && is_type_polymorphic(type)) {
+		gbString str = type_to_string(type);
+		error(e, "Invalid use of a polymorphic type '%s'", str);
+		gb_string_free(str);
+		type = t_invalid;
+	}
+	#endif
+
+	if (type->kind == Type_Named && base_type(type) == nullptr || is_type_typed(type)) {
+		add_type_and_value(ctx, e, Addressing_Type, type, empty_exact_value);
+	} else {
+		gbString name = type_to_string(type);
+		error(e, "Invalid type definition of %s", name);
+		gb_string_free(name);
+		type = t_invalid;
+	}
+	set_base_type(named_type, type);
+
+	check_rtti_type_disallowed(e, type, "Use of a type, %s, which has been disallowed");
+
+	return type;
+}
