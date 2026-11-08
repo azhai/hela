@@ -7444,6 +7444,7 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 		}
 		Entity *e = pt->params->Tuple.variables[i];
 		bool context_allocator_error = false;
+		bool hela_alloc_error = false;
 		if (e->kind == Entity_Variable) {
 			if (e->Variable.param_value.kind != ParameterValue_Invalid) {
 				if (ast_file_vet_explicit_allocators(c->file) && !checking_proc_group) {
@@ -7461,7 +7462,38 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 					}
 				}
 
+				// `#+analysis alloc`: a Hela file may not take `context.allocator` /
+				// `context.temp_allocator` implicitly. The compiler already knows exactly where
+				// that happens (this is the same test `-vet-explicit-allocators` uses), so this is
+				// a real check rather than a syntactic guess about which procs allocate.
+				AstFile *hela_file = call->thread_safe_file();
+				bool hela_alloc = hela_file != nullptr &&
+					(hela_file->flags & AstFile_IsHela) != 0 &&
+					(ast_file_analysis_flags(hela_file) & AnalysisFlag_Alloc) != 0 &&
+					(build_context.no_analysis_flags & AnalysisFlag_Alloc) == 0;
+				if (hela_alloc && !context_allocator_error) {
+					Ast *orig = e->Variable.param_value.original_ast_expr;
+					if (orig != nullptr && orig->kind == Ast_SelectorExpr) {
+						Ast *base = orig->SelectorExpr.expr;
+						Ast *sel  = orig->SelectorExpr.selector;
+						if (base != nullptr && base->kind == Ast_Implicit &&
+						    base->Implicit.string == STR_LIT("context") &&
+						    sel != nullptr && sel->kind == Ast_Ident &&
+						    (sel->Ident.token.string == STR_LIT("allocator") ||
+						     sel->Ident.token.string == STR_LIT("temp_allocator"))) {
+							hela_alloc_error = true;
+						}
+					}
+				}
+
 				if (!context_allocator_error) {
+					// Emit here rather than in the error block below: that block is only reached
+					// when argument resolution already failed. A hidden allocation is not an
+					// overload failure; the call is valid, the file just promised not to hide it.
+					if (show_error && hela_alloc_error) {
+						error(call, "'#+analysis alloc': parameter '%.*s' defaults to 'context' and hides a possible allocation. Pass an allocator explicitly (your boot arena) so the allocation is visible in the source.",
+						      LIT(e->token.string));
+					}
 					if (is_type_polymorphic(e->type) && e->Variable.param_value.kind == ParameterValue_Constant) {
 						// NOTE(bill): The parameter type is still polymorphic, so a constant default (e.g. `y: T = 0`) cannot be typed as '$T' here.
 						// Defer it like an untyped argument: determination resolves the parameter from the other arguments,
