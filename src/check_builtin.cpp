@@ -3119,6 +3119,12 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 	case BuiltinProc_has_target_feature:
 	case BuiltinProc_procedure_of:
 	case BuiltinProc_simd_indices:
+	case BuiltinProc_layout_padding_of:
+	case BuiltinProc_layout_tail_padding_of:
+	case BuiltinProc_layout_cache_lines_of:
+	case BuiltinProc_layout_bit_mask_of:
+	case BuiltinProc_layout_bit_encode_of:
+	case BuiltinProc_layout_hash_of:
 		// NOTE(bill): The first arg may be a Type, this will be checked case by case
 		break;
 
@@ -3385,6 +3391,147 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		break;
 	}
 
+
+	case BuiltinProc_layout_padding_of:
+	case BuiltinProc_layout_tail_padding_of:
+	case BuiltinProc_layout_cache_lines_of: {
+		Operand o = {};
+		check_expr_or_type(c, &o, ce->args[0]);
+		if (o.mode == Addressing_Invalid) {
+			return false;
+		}
+		Type *t = o.type;
+		if (t == nullptr || t == t_invalid) {
+			error(ce->args[0], "Invalid argument for '%.*s'", LIT(builtin_procs[id].name));
+			return false;
+		}
+		t = default_type(t);
+
+		i64 value = 0;
+		switch (id) {
+		case BuiltinProc_layout_padding_of:
+			value = type_padding_size(t, nullptr);
+			break;
+		case BuiltinProc_layout_tail_padding_of: {
+			i64 tail = 0;
+			type_padding_size(t, &tail);
+			value = tail;
+			break;
+		}
+		case BuiltinProc_layout_cache_lines_of: {
+			// Same source as `-emit-layout`, so a manifest and an assertion cannot disagree.
+			i64 const cache_line = get_layout_cache_line();
+			value = (type_size_of(t) + cache_line-1) / cache_line;
+			break;
+		}
+		default:
+			break;
+		}
+
+		operand->mode  = Addressing_Constant;
+		operand->value = exact_value_i64(value);
+		operand->type  = t_untyped_integer;
+		break;
+	}
+
+	case BuiltinProc_layout_bit_mask_of:
+	case BuiltinProc_layout_bit_encode_of: {
+		// Hela: `layout_bit_mask_of(T, "field")` is the field's mask, already shifted into its
+		// place in the backing word. `layout_bit_encode_of(T, "field", value)` is a value shifted
+		// into that place, with the compiler rejecting one that does not fit. Both read the same
+		// Type_BitField arrays that `-emit-layout` exports (bit_layout.cpp), so a routing rule
+		// and the manifest cannot disagree about the wire format.
+		Type *type = base_type(check_type(c, ce->args[0]));
+		if (type == nullptr || type == t_invalid) {
+			error(ce->args[0], "Expected a type for '%.*s'", LIT(builtin_name));
+			return false;
+		}
+		if (!is_type_bit_field(type)) {
+			gbString ts = type_to_string(type);
+			error(ce->args[0], "'%.*s' expects a bit_field type, got '%s'", LIT(builtin_name), ts);
+			gb_string_free(ts);
+			return false;
+		}
+
+		Operand x = {};
+		check_expr(c, &x, ce->args[1]);
+		if (!is_type_string(x.type) || x.mode != Addressing_Constant || x.value.kind != ExactValue_String) {
+			error(ce->args[1], "Expected a constant string for field argument");
+			return false;
+		}
+		InternedString field_name = string_interner_insert(x.value.value_string);
+
+		i64 bit_offset = 0;
+		i64 bit_size   = 0;
+		if (!bit_field_lookup(type, field_name, &bit_offset, &bit_size)) {
+			gbString ts = type_to_string(type);
+			error(ce->args[1], "'%s' is not a field of type %s", field_name.cstring(), ts);
+			gb_string_free(ts);
+			return false;
+		}
+		u64 mask = bit_field_mask(bit_offset, bit_size);
+		if (mask == 0) {
+			error(ce->args[1], "Bit field '%s' does not fit in a 64-bit word", field_name.cstring());
+			return false;
+		}
+
+		u64 value = mask;
+		if (id == BuiltinProc_layout_bit_encode_of) {
+			Operand v = {};
+			check_expr(c, &v, ce->args[2]);
+			if (v.mode != Addressing_Constant || v.value.kind != ExactValue_Integer) {
+				error(ce->args[2], "'layout_bit_encode_of' expects a compile-time integer value");
+				return false;
+			}
+			u64 raw   = exact_value_to_u64(v.value);
+			u64 limit = bit_size >= 64 ? 0xffffffffffffffffull : ((cast(u64)1 << bit_size) - 1);
+			if (raw > limit) {
+				error(ce->args[2], "Value %llu does not fit in the %lld-bit field '%s'",
+				      cast(unsigned long long)raw, cast(long long)bit_size, field_name.cstring());
+				return false;
+			}
+			value = (raw << bit_offset) & mask;
+		}
+
+		operand->mode  = Addressing_Constant;
+		operand->value = exact_value_u64(value);
+		operand->type  = t_untyped_integer;
+		break;
+	}
+
+	case BuiltinProc_layout_hash_of: {
+		// Hela: `layout_hash_of(T)` is the fingerprint of the bytes T occupies, computed by the
+		// same function that `-emit-layout` writes as `layout_hash` (layout_hash.cpp). A manifest
+		// entry and an `#assert` therefore cannot disagree about the shape of a type.
+		Operand o = {};
+		check_expr_or_type(c, &o, ce->args[0]);
+		if (o.mode == Addressing_Invalid) {
+			return false;
+		}
+		Type *t = o.type;
+		if (t == nullptr || t == t_invalid) {
+			error(ce->args[0], "Invalid argument for 'layout_hash_of'");
+			return false;
+		}
+		t = default_type(t);
+		if (is_type_polymorphic(t)) {
+			// A generic procedure body is only checked once it has been specialised (checker.cpp
+			// rejects an unspecialised one), so this is an open `$T` used outside a call: there is
+			// no layout to fingerprint, and computing offsets for it would cache a wrong layout
+			// for the eventual specialisation.
+			gbString ts = type_to_string(t);
+			error(ce->args[0], "'layout_hash_of' needs a concrete type, got '%s'", ts);
+			gb_string_free(ts);
+			return false;
+		}
+
+		// The hash must be computed on the *base* type: an alias keeps the same bytes but a
+		// different `kind`, and the manifest hashes `base_type(e->type)` too.
+		operand->mode  = Addressing_Constant;
+		operand->value = exact_value_u64(layout_hash_of_type(base_type(t)));
+		operand->type  = t_u64;
+		break;
+	}
 
 	case BuiltinProc_offset_of: {
 		// offset_of :: proc(value.field) -> uintptr

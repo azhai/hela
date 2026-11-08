@@ -235,6 +235,38 @@ type_field_type :: proc($T: typeid, $name: string) -> typeid ---
 type_field_bit_size :: proc($T: typeid, $name: string) -> int where type_is_bit_field(T) ---
 type_field_bit_offset :: proc($T: typeid, $name: string) -> int where type_is_bit_field(T) ---
 
+// Hela layout queries. These are compile-time constants, so they can be used in `#assert`,
+// `where` clauses and array lengths.
+//
+// layout_padding_of       The bytes of a struct that no named field covers (leading, interior and
+//                         trailing).
+// layout_tail_padding_of  The part of that after the last field.
+// layout_cache_lines_of   64-byte cache lines the type occupies, i.e. ceil(size_of(T)/64).
+layout_padding_of      :: proc($T: typeid) -> int where type_is_struct(T) ---
+layout_tail_padding_of :: proc($T: typeid) -> int where type_is_struct(T) ---
+layout_cache_lines_of  :: proc($T: typeid) -> int ---
+// Bit-level layout queries (Hela). Both are compile-time constants read from the compiler's
+// `bit_field` segment table, the same source `-emit-layout` exports as `bit_mask`.
+//
+// layout_bit_mask_of    The mask of one field, already shifted into place in the backing word.
+// layout_bit_encode_of  A field value shifted into place; a value that does not fit is a
+//                       compile-time error (compile-time integer required).
+//
+// Together they make a wire-format rule a *derived* value rather than a hand-written hex
+// literal: `mask = layout_bit_mask_of(Header, "kind")` cannot drift away from `Header`.
+layout_bit_mask_of   :: proc($T: typeid, $name: string) -> u64 ---
+layout_bit_encode_of :: proc($T: typeid, $name: string, $value: u64) -> u64 ---
+// layout_hash_of: the same fingerprint `-emit-layout` writes as `layout_hash`, as a compile-time
+// constant. It covers exactly the bytes: kind, size, align, packed, soa, array shape and every
+// named field's name/offset/size/bit range. It does NOT cover the type's name, its package, file
+// or line, nor `#explicit`/`#split`/`#align`/`#share`/`#atomic` — so two types that occupy the
+// same bytes the same way hash the same, and a padding field written `_: [56]u8` hashes as if it
+// were not there.
+//
+// Consequently `#assert(layout_hash_of(Wire) == 0x…)` is an ABI pin that needs no golden file and
+// no manifest at build time, and a runtime handshake can compare it instead of reading garbage.
+layout_hash_of :: proc($T: typeid) -> u64 ---
+
 type_proc_parameter_count :: proc($T: typeid) -> int where type_is_proc(T) ---
 type_proc_return_count    :: proc($T: typeid) -> int where type_is_proc(T) ---
 

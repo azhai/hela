@@ -413,6 +413,15 @@ BuiltinProc__type_end,
 
 	BuiltinProc_valgrind_client_request,
 
+	BuiltinProc_layout_padding_of,
+	BuiltinProc_layout_tail_padding_of,
+	BuiltinProc_layout_cache_lines_of,
+	// Hela: compile-time bit-segment masks / encoded values, read from Type_BitField.
+	BuiltinProc_layout_bit_mask_of,
+	BuiltinProc_layout_bit_encode_of,
+	// Hela: the byte-identity fingerprint of a type, the same value `-emit-layout` writes.
+	BuiltinProc_layout_hash_of,
+
 	BuiltinProc_COUNT,
 };
 gb_global BuiltinProc builtin_procs[BuiltinProc_COUNT] = {
@@ -823,4 +832,11 @@ gb_global BuiltinProc builtin_procs[BuiltinProc_COUNT] = {
 	{STR_LIT("wasm_memory_atomic_notify32"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("valgrind_client_request"), 7, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+
+	{STR_LIT("layout_padding_of"),      1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("layout_tail_padding_of"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("layout_cache_lines_of"),  1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("layout_bit_mask_of"),     2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("layout_bit_encode_of"),   3, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("layout_hash_of"),         1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 };
