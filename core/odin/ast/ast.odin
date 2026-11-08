@@ -594,6 +594,14 @@ Field_Flag :: enum {
 	No_Broadcast,
 	No_Capture,
 
+	// Hela: field-level `#align(N)`, `#offset(N)` and `#share(label)`. They carry an argument, so
+	// the parser consumes it separately and stores it on the field.
+	Align,
+	Offset,
+	Share,
+	// Hela: bare field prefix `#atomic`; carried in `flags`, not a separate AST node.
+	Atomic,
+
 	Results,
 	Tags,
 	Default_Parameters,
@@ -614,6 +622,10 @@ field_flag_strings := [Field_Flag]string{
 	.By_Ptr             = "#by_ptr",
 	.No_Broadcast       = "#no_broadcast",
 	.No_Capture         = "#no_capture",
+	.Align              = "#align",
+	.Offset             = "#offset",
+	.Share              = "#share",
+	.Atomic             = "#atomic",
 
 	.Results            = "results",
 	.Tags               = "field tag",
@@ -630,6 +642,7 @@ field_hash_flag_strings := []struct{key: string, flag: Field_Flag}{
 	{"by_ptr",       .By_Ptr},
 	{"no_broadcast", .No_Broadcast},
 	{"no_capture",   .No_Capture},
+	{"atomic",       .Atomic},
 }
 
 
@@ -637,6 +650,10 @@ Field_Flags_Struct :: Field_Flags{
 	.Using,
 	.Tags,
 	.Subtype,
+	.Align,
+	.Offset,
+	.Share,
+	.Atomic,
 }
 Field_Flags_Record_Poly_Params :: Field_Flags{
 	.Typeid_Token,
@@ -681,6 +698,11 @@ Field :: struct {
 	type:          ^Expr,
 	default_value: ^Expr, // possibly nil
 	tag:           tokenizer.Token,
+	// Hela: `#align(N)` / `#offset(N)` on this field (nil when absent) and the label of
+	// `#share(label)`. `#offset` is an absolute byte position, `#align` the next multiple of N.
+	align:         ^Expr,
+	offset:        ^Expr,
+	share:         tokenizer.Token,
 	flags:         Field_Flags,
 	comment:       ^Comment_Group, // possibly nil
 }
@@ -781,6 +803,9 @@ Struct_Type :: struct {
 	align:           ^Expr,       // possibly nil
 	min_field_align: ^Expr,       // possibly nil
 	max_field_align: ^Expr,       // possibly nil
+	// Hela dialect (`#+dialect hela`). `split` is the stride of `#split(N)`; both are parsed so
+	// that tools built on this AST can see them, they have no meaning for plain Odin.
+	split:           ^Expr,       // possibly nil
 	where_token:     tokenizer.Token,
 	where_clauses:   []^Expr,
 	is_packed:       bool,
@@ -788,6 +813,7 @@ Struct_Type :: struct {
 	is_no_copy:      bool,
 	is_all_or_none:  bool,
 	is_simple:       bool,
+	is_explicit:     bool,
 	fields:          ^Field_List,
 	name_count:      int,
 }

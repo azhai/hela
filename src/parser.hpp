@@ -122,6 +122,7 @@ enum AstFileFlag : u32 {
 	AstFile_IsLazy    = 1<<4,
 
 	AstFile_NoInstrumentation = 1<<5,
+	AstFile_IsHela            = 1<<6, // `#+dialect hela` at the top of the file
 };
 
 enum AstDelayQueueKind {
@@ -405,6 +406,16 @@ enum FieldFlag : u32 {
 	FieldFlag_no_broadcast = 1<<9, // disallow array programming
 
 	FieldFlag_no_capture  = 1<<11,
+	// Hela field prefixes: `#align(N)`, `#offset(N)` and `#share(label)`. They take arguments, so
+	// they are parsed by `parse_field_prefixes` itself rather than by the table above; the flags
+	// exist so that `check_field_prefixes` can reject them outside struct fields with the usual
+	// message.
+	FieldFlag_align       = 1<<12,
+	FieldFlag_share       = 1<<13,
+	FieldFlag_offset      = 1<<14,
+	// Hela: `#atomic` is a bare prefix declaring that a field is accessed atomically. It changes
+	// no bytes; the layout manifest exports it so tools can see the concurrency contract.
+	FieldFlag_atomic      = 1<<17,
 
 	// Internal use by the parser only
 	FieldFlag_Tags      = 1<<15,
@@ -419,7 +430,7 @@ enum FieldFlag : u32 {
 	                      FieldFlag_const|FieldFlag_any_int|FieldFlag_by_ptr|FieldFlag_no_broadcast|
 	                      FieldFlag_no_capture,
 
-	FieldFlag_Struct    = FieldFlag_using|FieldFlag_subtype|FieldFlag_Tags,
+	FieldFlag_Struct    = FieldFlag_using|FieldFlag_subtype|FieldFlag_Tags|FieldFlag_align|FieldFlag_share|FieldFlag_offset|FieldFlag_atomic,
 };
 
 enum StmtAllowFlag {
@@ -806,6 +817,16 @@ AST_KIND(_DeclEnd,   "", bool) \
 		Ast *        type;          \
 		Ast *        default_value; \
 		Token        tag;           \
+		/* Hela: `#align(N)` on this field, nullptr when absent. It raises the alignment of the */ \
+		/* field's *offset* (and of the struct), so a field can be pinned to a cache line. */    \
+		Ast *        align;         \
+		/* Hela: `#offset(N)` on this field, nullptr when absent. An *absolute* byte position, */ \
+		/* so the bytes in front of it are declared by this prefix alone -- unlike `#align`, */  \
+		/* which is a grid the field is pushed out to. */                                        \
+		Ast *        offset;        \
+		/* Hela: `#share(label)` on this field, a blank token when absent. The label names the */  \
+		/* writer of that field, which is what `#+analysis sharing` compares. */                  \
+		Token        share;         \
 		u32              flags;     \
 		CommentGroup *   docs;      \
 		CommentGroup *   comment;   \
@@ -868,6 +889,9 @@ AST_KIND(_TypeBegin, "", bool) \
 		Ast *count; \
 		Ast *elem; \
 		Ast *tag;  \
+		/* Hela: the W of `#aosoa[W][N]T`, nullptr for an ordinary array. `count` stays the */ \
+		/* logical element count N; the type becomes `[N/W]#soa[W]T`. */                     \
+		Ast *aosoa_block; \
 	}) \
 	AST_KIND(DynamicArrayType, "dynamic array type", struct { \
 		Token token; \
@@ -889,6 +913,7 @@ AST_KIND(_TypeBegin, "", bool) \
 		Ast *align;                 \
 		Ast *min_field_align;       \
 		Ast *max_field_align;       \
+		Ast *split;                 \
 		Token where_token;          \
 		Slice<Ast *> where_clauses; \
 		bool is_packed;             \
@@ -896,6 +921,8 @@ AST_KIND(_TypeBegin, "", bool) \
 		bool is_no_copy;            \
 		bool is_all_or_none;        \
 		bool is_simple;             \
+		bool is_explicit;           \
+		bool is_split;              \
 	}) \
 	AST_KIND(UnionType, "union type", struct { \
 		Scope *scope; \

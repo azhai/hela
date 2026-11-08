@@ -489,6 +489,8 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 	case Ast_Field:
 		n->Field.names = clone_ast_array(n->Field.names, f);
 		n->Field.type  = clone_ast(n->Field.type, f);
+		n->Field.align = clone_ast(n->Field.align, f);
+		n->Field.offset = clone_ast(n->Field.offset, f);
 		break;
 	case Ast_BitFieldField:
 		n->BitFieldField.name     = clone_ast(n->BitFieldField.name, f);
@@ -524,9 +526,10 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 		n->MultiPointerType.type = clone_ast(n->MultiPointerType.type, f);
 		break;
 	case Ast_ArrayType:
-		n->ArrayType.count = clone_ast(n->ArrayType.count, f);
-		n->ArrayType.elem  = clone_ast(n->ArrayType.elem, f);
-		n->ArrayType.tag   = clone_ast(n->ArrayType.tag, f);
+		n->ArrayType.count       = clone_ast(n->ArrayType.count, f);
+		n->ArrayType.elem        = clone_ast(n->ArrayType.elem, f);
+		n->ArrayType.tag         = clone_ast(n->ArrayType.tag, f);
+		n->ArrayType.aosoa_block = clone_ast(n->ArrayType.aosoa_block, f);
 		break;
 	case Ast_DynamicArrayType:
 		n->DynamicArrayType.elem = clone_ast(n->DynamicArrayType.elem, f);
@@ -543,6 +546,7 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 		n->StructType.align              = clone_ast(n->StructType.align, f);
 		n->StructType.min_field_align    = clone_ast(n->StructType.min_field_align, f);
 		n->StructType.max_field_align    = clone_ast(n->StructType.max_field_align, f);
+		n->StructType.split              = clone_ast(n->StructType.split, f);
 		n->StructType.where_clauses      = clone_ast_array(n->StructType.where_clauses, f);
 		break;
 	case Ast_UnionType:
@@ -1290,14 +1294,26 @@ gb_internal Ast *ast_bad_decl(AstFile *f, Token begin, Token end) {
 	return result;
 }
 
+// The field prefixes that carry an argument: `#align(N)`, `#offset(N)` and `#share(label)`.
+// Bundled so that threading them through the field parser does not grow a parameter list every
+// time one more is added.
+struct FieldPrefixArgs {
+	Ast * align  = nullptr; // `#align(N)`, nullptr when absent
+	Ast * offset = nullptr; // `#offset(N)`, nullptr when absent
+	Token share  = {};      // `#share(label)`, an invalid token when absent
+};
+
 gb_internal Ast *ast_field(AstFile *f, Array<Ast *> const &names, Ast *type, Ast *default_value, u32 flags, Token tag,
-               CommentGroup *docs, CommentGroup *comment) {
+               CommentGroup *docs, CommentGroup *comment, FieldPrefixArgs const &args = {}) {
 	Ast *result = alloc_ast_node(f, Ast_Field);
 	result->Field.names         = slice_from_array(names);
 	result->Field.type          = type;
 	result->Field.default_value = default_value;
 	result->Field.flags         = flags;
 	result->Field.tag           = tag;
+	result->Field.align         = args.align;
+	result->Field.offset        = args.offset;
+	result->Field.share         = args.share;
 	result->Field.docs          = docs;
 	result->Field.comment       = comment;
 	return result;
@@ -1407,8 +1423,8 @@ gb_internal Ast *ast_fixed_capacity_dynamic_array_type(AstFile *f, Token token, 
 }
 
 gb_internal Ast *ast_struct_type(AstFile *f, Token token, Slice<Ast *> fields, isize field_count,
-                     Ast *polymorphic_params, bool is_packed, bool is_raw_union, bool is_all_or_none, bool is_simple,
-                     Ast *align, Ast *min_field_align, Ast *max_field_align,
+                     Ast *polymorphic_params, bool is_packed, bool is_raw_union, bool is_all_or_none, bool is_simple, bool is_explicit,
+                     bool is_split, Ast *align, Ast *min_field_align, Ast *max_field_align, Ast *split,
                      Token where_token, Array<Ast *> const &where_clauses) {
 	Ast *result = alloc_ast_node(f, Ast_StructType);
 	result->StructType.token              = token;
@@ -1419,9 +1435,12 @@ gb_internal Ast *ast_struct_type(AstFile *f, Token token, Slice<Ast *> fields, i
 	result->StructType.is_raw_union       = is_raw_union;
 	result->StructType.is_all_or_none     = is_all_or_none;
 	result->StructType.is_simple          = is_simple;
+	result->StructType.is_explicit        = is_explicit;
+	result->StructType.is_split           = is_split;
 	result->StructType.align              = align;
 	result->StructType.min_field_align    = min_field_align;
 	result->StructType.max_field_align    = max_field_align;
+	result->StructType.split              = split;
 	result->StructType.where_token        = where_token;
 	result->StructType.where_clauses      = slice_from_array(where_clauses);
 	return result;
@@ -3157,6 +3176,31 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 				break;
 			}
 			return original_type;
+		} else if (name.string == "aosoa") {
+			// `#aosoa[W][N]T` — blocks of W elements, N elements in total. It is `[N/W]#soa[W]T`
+			// spelled from the logical side: the block width is an implementation detail, the
+			// element count is what the rest of the program indexes with.
+			Ast *tag = ast_basic_directive(f, token, name);
+			Ast *block = nullptr;
+			if (allow_token(f, Token_OpenBracket)) {
+				if (f->curr_token.kind != Token_CloseBracket) {
+					block = parse_expr(f, false);
+				}
+				expect_token_after(f, Token_CloseBracket, "'#aosoa[W]'");
+			} else {
+				syntax_error(tag, "Expected '#aosoa[W][N]T', e.g. '#aosoa[8][4096]Vec3'");
+			}
+			Ast *original_type = parse_type(f);
+			Ast *type = unparen_expr(original_type);
+			if (type->kind != Ast_ArrayType || type->ArrayType.count == nullptr) {
+				syntax_error(type, "Expected a fixed array type after #%.*s, got %.*s", LIT(name.string), LIT(ast_strings[type->kind]));
+			} else if (block == nullptr) {
+				// already reported above
+			} else {
+				type->ArrayType.tag         = tag;
+				type->ArrayType.aosoa_block = block;
+			}
+			return original_type;
 		} else if (name.string == "row_major" ||
 		           name.string == "column_major") {
 			Ast *original_type = parse_type(f);
@@ -3514,9 +3558,12 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 		bool is_all_or_none     = false;
 		bool is_raw_union       = false;
 		bool is_simple          = false;
+		bool is_explicit        = false;
+		bool is_split           = false;
 		Ast *align              = nullptr;
 		Ast *min_field_align    = nullptr;
 		Ast *max_field_align    = nullptr;
+		Ast *split              = nullptr;
 
 		if (allow_token(f, Token_OpenParen)) {
 			isize param_count = 0;
@@ -3605,6 +3652,30 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 					syntax_error(tag, "Duplicate struct tag '#%.*s'", LIT(tag.string));
 				}
 				is_simple = true;
+			} else if (tag.string == "explicit") {
+				if (is_explicit) {
+					syntax_error(tag, "Duplicate struct tag '#%.*s'", LIT(tag.string));
+				}
+				is_explicit = true;
+			} else if (tag.string == "split") {
+				// `#split(N)`: every field starts on an N-byte boundary, and the struct ends on one
+				// too. It is `#align(N) #min_field_align(N)` with the padding declared rather than
+				// implied, which is what makes it usable on a struct that must not share a cache
+				// line between fields.
+				if (is_split) {
+					syntax_error(tag, "Duplicate struct tag '#%.*s'", LIT(tag.string));
+				}
+				is_split = true;
+				split = parse_expr(f, true);
+				if (split == nullptr) {
+					syntax_error(tag, "'#split' requires a stride, e.g. '#split(64)'");
+				} else if (split->kind != Ast_ParenExpr) {
+					ERROR_BLOCK();
+					gbString s = expr_to_string(split);
+					syntax_warning(tag, "#split requires parentheses around the expression");
+					error_line("\tSuggestion: #split(%s)", s);
+					gb_string_free(s);
+				}
 			} else {
 				syntax_error(tag, "Invalid struct tag '#%.*s'", LIT(tag.string));
 			}
@@ -3646,8 +3717,8 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 		parser_check_polymorphic_record_parameters(f, polymorphic_params);
 
 		return ast_struct_type(f, token, decls, name_count,
-		                       polymorphic_params, is_packed, is_raw_union, is_all_or_none, is_simple,
-		                       align, min_field_align, max_field_align,
+		                       polymorphic_params, is_packed, is_raw_union, is_all_or_none, is_simple, is_explicit,
+		                       is_split, align, min_field_align, max_field_align, split,
 		                       where_token, where_clauses);
 	} break;
 
@@ -4880,6 +4951,7 @@ gb_global ParseFieldPrefixMapping const parse_field_prefix_mappings[] = {
 	{str_lit("subtype"),      Token_Hash,      FieldFlag_subtype},
 	{str_lit("by_ptr"),       Token_Hash,      FieldFlag_by_ptr},
 	{str_lit("no_broadcast"), Token_Hash,      FieldFlag_no_broadcast},
+	{str_lit("atomic"),       Token_Hash,      FieldFlag_atomic},
 };
 
 
@@ -4925,10 +4997,82 @@ gb_internal FieldFlag is_token_field_prefix(AstFile *f) {
 	return FieldFlag_Invalid;
 }
 
-gb_internal u32 parse_field_prefixes(AstFile *f) {
+// `#align(N)`, `#offset(N)` and `#share(label)` are the field prefixes that carry an argument.
+// They are matched here rather than in `parse_field_prefix_mappings`, because that table only
+// consumes a bare `#name` and these must also consume their `(...)`.
+gb_internal FieldFlag parse_argument_field_prefix(AstFile *f, FieldPrefixArgs *args) {
+	if (f->curr_token.kind != Token_Hash) {
+		return FieldFlag_NONE;
+	}
+	Token name = peek_token(f);
+	if (name.kind != Token_Ident) {
+		return FieldFlag_NONE;
+	}
+
+	if (name.string == "align" || name.string == "offset") {
+		bool const is_align = name.string == "align";
+		FieldFlag flag = is_align ? FieldFlag_align : FieldFlag_offset;
+		char const *what = is_align ? "#align(N)" : "#offset(N)";
+		Ast **slot = is_align ? &args->align : &args->offset;
+
+		advance_token(f); // '#'
+		advance_token(f); // 'align' | 'offset'
+		expect_token(f, Token_OpenParen);
+		Ast *expr = nullptr;
+		if (f->curr_token.kind != Token_CloseParen) {
+			expr = parse_expr(f, false);
+		}
+		expect_token_after(f, Token_CloseParen, is_align ? "'#align(N)'" : "'#offset(N)'");
+		if (expr == nullptr) {
+			syntax_error(name, "'%s' requires a byte count, e.g. '%s'", what,
+			             is_align ? "#align(64)" : "#offset(16)");
+		} else if (*slot != nullptr) {
+			syntax_error(name, "Duplicate '%s' on this field", is_align ? "#align" : "#offset");
+		} else {
+			*slot = expr;
+		}
+		return flag;
+	}
+
+	if (name.string == "share") {
+		advance_token(f); // '#'
+		advance_token(f); // 'share'
+		expect_token(f, Token_OpenParen);
+		Token label = {};
+		if (f->curr_token.kind == Token_Ident || f->curr_token.kind == Token_String) {
+			label = f->curr_token;
+			advance_token(f);
+		} else {
+			syntax_error(f->curr_token, "Expected a writer name in '#share(...)', e.g. '#share(worker_a)'");
+		}
+		expect_token_after(f, Token_CloseParen, "'#share(label)'");
+		if (label.kind == Token_Invalid) {
+			// already reported
+		} else if (args->share.kind != Token_Invalid) {
+			syntax_error(name, "Duplicate '#share' on this field");
+		} else {
+			args->share = label;
+		}
+		return FieldFlag_share;
+	}
+
+	return FieldFlag_NONE;
+}
+
+gb_internal u32 parse_field_prefixes(AstFile *f, FieldPrefixArgs *args_ = nullptr) {
 	i32 counts[gb_count_of(parse_field_prefix_mappings)] = {};
+	u32 direct_flags = 0;
+
+	FieldPrefixArgs dummy = {};
+	FieldPrefixArgs *args = args_ != nullptr ? args_ : &dummy;
 
 	for (;;) {
+		FieldFlag special = parse_argument_field_prefix(f, args);
+		if (special != FieldFlag_NONE) {
+			direct_flags |= special;
+			continue;
+		}
+
 		FieldFlag flag = is_token_field_prefix(f);
 		if (flag & FieldFlag_Invalid) {
 			break;
@@ -4948,7 +5092,7 @@ gb_internal u32 parse_field_prefixes(AstFile *f) {
 		}
 	}
 
-	u32 field_flags = 0;
+	u32 field_flags = direct_flags;
 	for (i32 i = 0; i < gb_count_of(parse_field_prefix_mappings); i++) {
 		if (counts[i] > 0) {
 			field_flags |= parse_field_prefix_mappings[i].flag;
@@ -4992,12 +5136,32 @@ gb_internal u32 check_field_prefixes(AstFile *f, isize name_count, u32 allowed_f
 			set_flags &= ~m.flag;
 		}
 	}
+
+	// `#align`, `#offset` and `#share` take arguments, so they never made it into the table above.
+	struct FieldPrefixName {
+		u32         flag;
+		char const *name;
+	};
+	static FieldPrefixName const argument_prefixes[] = {
+		{FieldFlag_align, "align"},
+		{FieldFlag_offset, "offset"},
+		{FieldFlag_share, "share"},
+	};
+	for (auto const &ap : argument_prefixes) {
+		if ((set_flags & ap.flag) != 0 && (allowed_flags & ap.flag) == 0) {
+			syntax_error(f->curr_token, "'#%s' is not allowed within this field list", ap.name);
+			set_flags &= ~ap.flag;
+		}
+	}
 	return set_flags;
 }
 
 struct AstAndFlags {
 	Ast *node;
 	u32      flags;
+	Ast *align;
+	Ast *offset;
+	Token    share;
 };
 
 gb_internal Array<Ast *> convert_to_ident_list(AstFile *f, Array<AstAndFlags> list, bool ignore_flags, bool allow_poly_names) {
@@ -5142,7 +5306,8 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 	       f->curr_token.kind != Token_Colon &&
 	       f->curr_token.kind != Token_EOF) {
 		if (!is_signature) parse_enforce_tabs(f);
-		u32 flags = parse_field_prefixes(f);
+		FieldPrefixArgs item_args = {};
+		u32 flags = parse_field_prefixes(f, &item_args);
 		Ast *param = parse_var_type(f, allow_ellipsis, allow_typeid_token);
 		if (param->kind == Ast_Ellipsis) {
 			if (seen_ellipsis) syntax_error(param, "Extra variadic parameter after ellipsis");
@@ -5150,7 +5315,7 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		} else if (seen_ellipsis) {
 			syntax_error(param, "Extra parameter after ellipsis");
 		}
-		AstAndFlags naf = {param, flags};
+		AstAndFlags naf = {param, flags, item_args.align, item_args.offset, item_args.share};
 		array_add(&list, naf);
 		if (!allow_field_separator(f)) {
 			break;
@@ -5173,7 +5338,11 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 			names[0] = ast_ident(f, token);
 			u32 flags = check_field_prefixes(f, list.count, allowed_flags, item.flags);
 			Token tag = {};
-			Ast *param = ast_field(f, names, item.node, nullptr, flags, tag, docs, f->line_comment);
+			FieldPrefixArgs args = {};
+			if (flags & FieldFlag_align)  args.align  = item.align;
+			if (flags & FieldFlag_offset) args.offset = item.offset;
+			if (flags & FieldFlag_share)  args.share  = item.share;
+			Ast *param = ast_field(f, names, item.node, nullptr, flags, tag, docs, f->line_comment, args);
 			array_add(&params, param);
 		}
 
@@ -5196,6 +5365,14 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		set_flags = list[0].flags;
 	}
 	set_flags = check_field_prefixes(f, names.count, allowed_flags, set_flags);
+	// The argument of `#align`/`#offset`/`#share` belongs to the whole field, so it comes from the
+	// first item of the group (`x, y: u64` shares one alignment, just like it shares one type).
+	FieldPrefixArgs field_args = {};
+	if (list.count > 0) {
+		if (set_flags & FieldFlag_align)  field_args.align  = list[0].align;
+		if (set_flags & FieldFlag_offset) field_args.offset = list[0].offset;
+		if (set_flags & FieldFlag_share)  field_args.share  = list[0].share;
+	}
 	total_name_count += names.count;
 
 	Ast *type = nullptr;
@@ -5255,7 +5432,7 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 	}
 
 	bool more_fields = allow_field_separator(f);
-	Ast *param = ast_field(f, names, type, default_value, set_flags, tag, docs, f->line_comment);
+	Ast *param = ast_field(f, names, type, default_value, set_flags, tag, docs, f->line_comment, field_args);
 	array_add(&params, param);
 
 	if (!more_fields) {
@@ -5269,7 +5446,8 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		CommentGroup *docs = f->lead_comment;
 
 		if (!is_signature) parse_enforce_tabs(f);
-		u32 set_flags = parse_field_prefixes(f);
+		FieldPrefixArgs next_args = {};
+		u32 set_flags = parse_field_prefixes(f, &next_args);
 		Token tag = {};
 		Array<Ast *> names = parse_ident_list(f, allow_poly_names);
 		if (names.count == 0) {
@@ -5278,6 +5456,10 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		}
 		bool any_polymorphic_names = check_procedure_name_list(names);
 		set_flags = check_field_prefixes(f, names.count, allowed_flags, set_flags);
+		FieldPrefixArgs item_args = {};
+		if (set_flags & FieldFlag_align)  item_args.align  = next_args.align;
+		if (set_flags & FieldFlag_offset) item_args.offset = next_args.offset;
+		if (set_flags & FieldFlag_share)  item_args.share  = next_args.share;
 		total_name_count += names.count;
 
 		Ast *type = nullptr;
@@ -5331,7 +5513,7 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 
 
 		bool ok = allow_field_separator(f);
-		Ast *param = ast_field(f, names, type, default_value, set_flags, tag, docs, f->line_comment);
+		Ast *param = ast_field(f, names, type, default_value, set_flags, tag, docs, f->line_comment, item_args);
 		array_add(&params, param);
 
 		if (!ok) {
@@ -6556,7 +6738,7 @@ gb_internal void parser_add_foreign_file_to_process(Parser *p, AstPackage *pkg, 
 
 // NOTE(bill): Returns true if it's added
 gb_internal AstPackage *try_add_import_path(Parser *p, String path, String const &rel_path, TokenPos pos, PackageKind kind = Package_Normal) {
-	String const FILE_EXT = str_lit(".odin");
+	String const FILE_EXT     = str_lit(".odin");
 
 	MUTEX_GUARD_BLOCK(&p->imported_files_mutex) {
 		if (string_set_update(&p->imported_files, path)) {
@@ -7316,6 +7498,8 @@ gb_internal u64 parse_analysis_tag(Token token_for_pos, String s, u64 base_analy
 			error_line("\tExpected one of the following\n");
 			error_line("\tescape\n");
 			error_line("\tatomic\n");
+			error_line("\tsharing\n");
+			error_line("\talloc\n");
 			return analysis_flags;
 		}
 		if (is_notted) {
@@ -7516,6 +7700,20 @@ gb_internal bool parse_file_tag(const String &lc, const Token &tok, AstFile *f) 
 		f->analysis_flags = parse_analysis_tag(tok, lc, ast_file_analysis_flags(f));
 		f->analysis_flags_set = true;
 		global_tagged_analysis_flags.fetch_or(f->analysis_flags, std::memory_order_relaxed);
+	} else if (string_starts_with(lc, str_lit("dialect"))) {
+		String name = string_trim_whitespace(string_trim_starts_with(lc, str_lit("dialect")));
+		if (name.len == 0) {
+			syntax_error(tok, "Expected a dialect name after '#+dialect', e.g. '#+dialect hela'");
+			return false;
+		}
+		if (name == "hela") {
+			f->flags |= AstFile_IsHela;
+		} else if (name == "odin") {
+			// The default dialect, nothing to do.
+		} else {
+			syntax_error(tok, "Unknown dialect '%.*s'. The dialects are 'odin' and 'hela'", LIT(name));
+			return false;
+		}
 	} else if (string_starts_with(lc, str_lit("test"))) {
 		if ((build_context.command_kind & Command_test) == 0) {
 			return false;

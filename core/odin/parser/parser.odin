@@ -1842,6 +1842,8 @@ new_ast_field :: proc(names: []^ast.Expr, type: ^ast.Expr, default_value: ^ast.E
 Expr_And_Flags :: struct {
 	expr:  ^ast.Expr,
 	flags: ast.Field_Flags,
+	// Hela field prefixes that carry an argument; see parse_field_prefixes.
+	prefix: Field_Prefix_Args,
 }
 
 convert_to_ident_list :: proc(p: ^Parser, list: []Expr_And_Flags, ignore_flags, allow_poly_names: bool) -> []^ast.Expr {
@@ -1911,10 +1913,98 @@ is_token_field_prefix :: proc(p: ^Parser) -> ast.Field_Flag {
 	return .Invalid
 }
 
-parse_field_prefixes :: proc(p: ^Parser) -> (flags: ast.Field_Flags) {
+// The field prefixes that carry an argument: `#align(N)`, `#offset(N)` and `#share(label)`.
+// Bundled so that threading them through the field parser does not grow a parameter list every
+// time one more is added.
+Field_Prefix_Args :: struct {
+	align:  ^ast.Expr,
+	offset: ^ast.Expr,
+	share:  tokenizer.Token,
+}
+
+// `#align(N)`, `#offset(N)` and `#share(label)` carry an argument, so they are matched here rather
+// than through `field_hash_flag_strings` (which only knows bare `#name`).
+parse_argument_field_prefix :: proc(p: ^Parser, args: ^Field_Prefix_Args) -> (flag: ast.Field_Flag) {
+	if p.curr_tok.kind != .Hash {
+		return .Invalid
+	}
+	name := peek_token(p)
+	if name.kind != .Ident {
+		return .Invalid
+	}
+
+	switch name.text {
+	case "align", "offset":
+		is_align := name.text == "align"
+		slot: ^^ast.Expr = &args.offset
+		if is_align {
+			slot = &args.align
+		}
+		what := "#offset(N)"
+		example := "'#offset(16)'"
+		if is_align {
+			what = "#align(N)"
+			example = "'#align(64)'"
+		}
+		_ = expect_token(p, .Hash)
+		_ = expect_token(p, .Ident)
+		_ = expect_token(p, .Open_Paren)
+		expr: ^ast.Expr
+		if p.curr_tok.kind != .Close_Paren {
+			expr = parse_expr(p, false)
+		}
+		expect_token_after(p, .Close_Paren, what)
+		if expr == nil {
+			error(p, name.pos, "'%s' requires a byte count, e.g. %s", what, example)
+		} else if slot^ != nil {
+			error(p, name.pos, "duplicate '#align'/'#offset' on this field")
+		} else {
+			slot^ = expr
+		}
+		if is_align {
+			return .Align
+		}
+		return .Offset
+
+	case "share":
+		_ = expect_token(p, .Hash)
+		_ = expect_token(p, .Ident)
+		_ = expect_token(p, .Open_Paren)
+		label: tokenizer.Token
+		if p.curr_tok.kind == .Ident || p.curr_tok.kind == .String {
+			label = p.curr_tok
+			advance_token(p)
+		} else {
+			error(p, p.curr_tok.pos, "expected a writer name in '#share(...)', e.g. '#share(worker_a)'")
+		}
+		expect_token_after(p, .Close_Paren, "'#share(label)'")
+		if label.kind == .Invalid {
+			// already reported
+		} else if args.share.kind != .Invalid {
+			error(p, name.pos, "duplicate '#share' on this field")
+		} else {
+			args.share = label
+		}
+		return .Share
+	}
+
+	return .Invalid
+}
+
+parse_field_prefixes :: proc(p: ^Parser, args_in: ^Field_Prefix_Args = nil) -> (flags: ast.Field_Flags) {
 	counts: [len(ast.Field_Flag)]int
+	args_dummy: Field_Prefix_Args
+	args := args_in
+	if args == nil {
+		args = &args_dummy
+	}
 
 	for {
+		if special := parse_argument_field_prefix(p, args); special != .Invalid {
+			flags += {special}
+			continue
+		}
+
 		kind := is_token_field_prefix(p)
 		if kind == .Invalid {
 			break
@@ -2066,6 +2156,7 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 	                     docs: ^ast.Comment_Group,
 	                     names: []^ast.Expr,
 	                     allowed_flags, set_flags: ast.Field_Flags,
+	                     prefix: Field_Prefix_Args,
 	                     ) -> bool {
 
 		expect_field_separator :: proc(p: ^Parser, param: ^ast.Expr) -> bool {
@@ -2154,6 +2245,9 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 		field.tag     = tag
 		field.docs    = docs
 		field.flags   = flags
+		field.align   = prefix.align  if .Align  in flags else nil
+		field.offset  = prefix.offset if .Offset in flags else nil
+		field.share   = prefix.share  if .Share  in flags else {}
 		field.comment = p.line_comment if p.line_comment != nil else line_comment
 		append(fields, field)
 
@@ -2178,7 +2272,8 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 	for p.curr_tok.kind != follow &&
 	    p.curr_tok.kind != .Colon &&
 	    p.curr_tok.kind != .EOF {
-		prefix_flags := parse_field_prefixes(p)
+		item_prefix: Field_Prefix_Args
+		prefix_flags := parse_field_prefixes(p, &item_prefix)
 		param := parse_var_type(p, allowed_flags & {.Typeid_Token, .Ellipsis})
 		if _, ok := param.derived.(^ast.Ellipsis); ok {
 			if seen_ellipsis {
@@ -2189,7 +2284,7 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 			error(p, param.pos, "extra parameter after ellipsis")
 		}
 
-		eaf := Expr_And_Flags{param, prefix_flags}
+		eaf := Expr_And_Flags{param, prefix_flags, item_prefix}
 		append(&list, eaf)
 		allow_token(p, .Comma) or_break
 	}
@@ -2231,15 +2326,20 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 			set_flags = list[0].flags
 		}
 		total_name_count += len(names)
-		handle_field(p, &seen_ellipsis, &fields, docs, names, allowed_flags, set_flags)
+		field_prefix: Field_Prefix_Args
+		if len(list) > 0 {
+			field_prefix = list[0].prefix
+		}
+		handle_field(p, &seen_ellipsis, &fields, docs, names, allowed_flags, set_flags, field_prefix)
 
 		for p.curr_tok.kind != follow && p.curr_tok.kind != .EOF {
 			docs = p.lead_comment
-			set_flags = parse_field_prefixes(p)
+			next_prefix: Field_Prefix_Args
+			set_flags = parse_field_prefixes(p, &next_prefix)
 			names = parse_ident_list(p, allow_poly_names)
 
 			total_name_count += len(names)
-			handle_field(p, &seen_ellipsis, &fields, docs, names, allowed_flags, set_flags) or_break
+			handle_field(p, &seen_ellipsis, &fields, docs, names, allowed_flags, set_flags, next_prefix) or_break
 		}
 	}
 
@@ -2849,11 +2949,13 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 		align:           ^ast.Expr
 		min_field_align: ^ast.Expr
 		max_field_align: ^ast.Expr
+		split:           ^ast.Expr
 		is_packed:       bool
 		is_raw_union:    bool
 		is_no_copy:      bool
 		is_all_or_none:  bool
 		is_simple:       bool
+		is_explicit:     bool
 		fields:          ^ast.Field_List
 		name_count:      int
 
@@ -2918,6 +3020,18 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 					error(p, tag.pos, "duplicate struct tag '#%s'", tag.text)
 				}
 				is_no_copy = true
+			case "explicit":
+				// Hela: every byte of the struct must be named by a field.
+				if is_explicit {
+					error(p, tag.pos, "duplicate struct tag '#%s'", tag.text)
+				}
+				is_explicit = true
+			case "split":
+				// Hela: every field starts on an N-byte boundary.
+				if split != nil {
+					error(p, tag.pos, "duplicate struct tag '#%s'", tag.text)
+				}
+				split = parse_expr(p, true)
 			case:
 				error(p, tag.pos, "invalid struct tag '#%s", tag.text)
 			}
@@ -2952,11 +3066,13 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 		st.align             = align
 		st.min_field_align   = min_field_align
 		st.max_field_align   = max_field_align
+		st.split             = split
 		st.is_packed         = is_packed
 		st.is_raw_union      = is_raw_union
 		st.is_no_copy        = is_no_copy
 		st.is_all_or_none    = is_all_or_none
 		st.is_simple         = is_simple
+		st.is_explicit       = is_explicit
 		st.fields            = fields
 		st.name_count        = name_count
 		st.where_token       = where_token
