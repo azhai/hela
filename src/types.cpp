@@ -147,6 +147,10 @@ struct TypeStruct {
 	i64             custom_align;
 	i64             custom_min_field_align;
 	i64             custom_max_field_align;
+	// `#split(N)`: non-zero means every field starts at `round_up(previous_end, N)` and the struct
+	// ends on an N boundary. Kept separate from `custom_min_field_align` because only this one is a
+	// declaration of intent that tools and the manifest can report.
+	i64             split_align;
 	Type *          polymorphic_params; // Type_Tuple
 	Type *          polymorphic_parent;
 	Wait_Signal     polymorphic_wait_signal;
@@ -162,6 +166,7 @@ struct TypeStruct {
 	bool            is_polymorphic;
 	bool            are_offsets_set             : 1;
 	bool            is_packed                   : 1;
+	bool            is_explicit_layout          : 1;
 	bool            is_raw_union                : 1;
 	bool            is_all_or_none              : 1;
 	bool            is_simple                   : 1;
@@ -244,6 +249,9 @@ struct TypeNamed {
 		Type *elem;                                       \
 		i64   count;                                      \
 		Type *generic_count;                              \
+		/* Hela: the W of `#aosoa[W][N]T`, 0 for an ordinary array. `count` is the number of */ \
+		/* blocks (N/W); the logical element count is count * aosoa_width. */                 \
+		i32   aosoa_width;                                \
 	})                                                        \
 	TYPE_KIND(EnumeratedArray, struct {                       \
 		Type *elem;                                       \
@@ -1137,11 +1145,13 @@ gb_internal Type *alloc_type_array(Type *elem, i64 count, Type *generic_count = 
 		t->Array.elem = elem;
 		t->Array.count = count;
 		t->Array.generic_count = generic_count;
+		t->Array.aosoa_width = 0;
 		return t;
 	}
 	Type *t = alloc_type(Type_Array);
 	t->Array.elem = elem;
 	t->Array.count = count;
+	t->Array.aosoa_width = 0;
 	return t;
 }
 
@@ -4576,6 +4586,25 @@ gb_internal void wait_for_union_variants(Type *t) {
 	}
 }
 
+// The alignment a field asked for with `#align(N)` (Hela), or 0 when it did not ask. Stored on the
+// entity rather than on the type: two fields of the same type can want different alignments.
+gb_internal i64 type_field_align_of(Entity *f) {
+	if (f == nullptr || f->kind != Entity_Variable) {
+		return 0;
+	}
+	return f->Variable.custom_align;
+}
+
+// The absolute byte offset a field asked for with `#offset(N)` (Hela), or -1 when it did not ask.
+// Unlike `#align(N)` this is not a grid the field is pushed out to but an exact position, which is
+// why it is a separate field on the entity rather than a large alignment.
+gb_internal i64 type_field_offset_of(Entity *f) {
+	if (f == nullptr || f->kind != Entity_Variable) {
+		return -1;
+	}
+	return f->Variable.custom_offset;
+}
+
 gb_internal i64 type_align_of_internal(Type *t, TypePath *path) {
 	GB_ASSERT(path != nullptr);
 	if (t->failure) {
@@ -4725,6 +4754,12 @@ gb_internal i64 type_align_of_internal(Type *t, TypePath *path) {
 			if (max < align) {
 				max = align;
 			}
+			// `#align(N)` on a field is also the struct's alignment, otherwise an array of the
+			// struct would move the field off the boundary it asked for.
+			i64 declared = type_field_align_of(t->Struct.fields[i]);
+			if (max < declared) {
+				max = declared;
+			}
 		}
 
 		if (t->Struct.custom_min_field_align > 0) {
@@ -4799,11 +4834,32 @@ gb_internal i64 *type_set_offsets_of(Slice<Entity *> const &fields, bool is_pack
 				offsets[i] = -1;
 			} else {
 				Type *t = fields[i]->type;
+				i64 size  = gb_max(type_size_of_internal(t, &path), 0);
+				// A field-level `#offset(N)` (Hela) is an absolute position: the bytes in front of
+				// it are declared by the prefix itself, so no alignment grid applies. Clamping to
+				// `curr_offset` keeps offsets monotonic even if the checker missed an overlap; it
+				// reports `N < previous field end` on its own.
+				i64 declared_offset = type_field_offset_of(fields[i]);
+				if (declared_offset >= 0) {
+					if (declared_offset > curr_offset) {
+						curr_offset = declared_offset;
+					}
+					offsets[i] = curr_offset;
+					curr_offset += size;
+					continue;
+				}
 				i64 align = gb_max(type_align_of_internal(t, &path), min_field_align);
+				// A field-level `#align(N)` (Hela). It only ever raises: an offset can be forced
+				// onto a cache line, but a field can never be placed at less than its own natural
+				// alignment without lying about its type to the backend. The checker rejects
+				// `N < align_of(field type)` for the same reason.
+				i64 declared = type_field_align_of(fields[i]);
+				if (declared > align) {
+					align = declared;
+				}
 				if (max_field_align != 0) {
 					align = gb_min(align, max_field_align);
 				}
-				i64 size  = gb_max(type_size_of_internal(t, &path), 0);
 				curr_offset = align_formula(curr_offset, align);
 				offsets[i] = curr_offset;
 				curr_offset += size;
@@ -4841,6 +4897,43 @@ gb_internal bool type_set_offsets(Type *t) {
 		GB_PANIC("Invalid type for setting offsets");
 	}
 	return false;
+}
+
+// The number of bytes of a struct that no named field covers (leading, interior and trailing).
+// `tail_padding`, when not nullptr, receives the part after the last field. This is the single
+// definition used by `-emit-layout` and by `intrinsics.layout_*`, so they cannot disagree.
+gb_internal i64 type_padding_size(Type *t, i64 *tail_padding_) {
+	if (tail_padding_ != nullptr) {
+		*tail_padding_ = 0;
+	}
+	if (t == nullptr) {
+		return 0;
+	}
+	t = base_type(t);
+	if (t == nullptr || t->kind != Type_Struct || t->Struct.soa_kind != StructSoa_None) {
+		return 0;
+	}
+	type_set_offsets(t);
+	i64 cursor  = 0;
+	i64 padding = 0;
+	for_array(i, t->Struct.fields) {
+		i64 offset = t->Struct.offsets[i];
+		i64 size   = type_size_of(t->Struct.fields[i]->type);
+		if (offset > cursor) {
+			padding += offset - cursor;
+		}
+		if (offset + size > cursor) {
+			cursor = offset + size;
+		}
+	}
+	i64 size = type_size_of(t);
+	if (size > cursor) {
+		padding += size - cursor;
+		if (tail_padding_ != nullptr) {
+			*tail_padding_ = size - cursor;
+		}
+	}
+	return padding;
 }
 
 gb_internal i64 type_size_of_internal(Type *t, TypePath *path) {

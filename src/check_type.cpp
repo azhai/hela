@@ -3,6 +3,13 @@ gb_internal Type *determine_type_from_polymorphic(CheckerContext *ctx, Type *pol
 gb_internal bool subst_check_specialization(CheckerContext *ctx, Type *specialization, Type *type, bool modify_type);
 gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is_variadic_, isize *variadic_index_, bool *success_, isize *specialization_count_, Array<Operand> const *operands);
 gb_internal void populate_using_entity_scope(CheckerContext *ctx, Ast *node, AstField *field, Type *t, isize level);
+// Defined below `check_custom_align`/`hela_file_of`, used by `check_struct_fields` above them.
+gb_internal bool check_custom_align(CheckerContext *ctx, Ast *node, i64 *align_, char const *msg);
+gb_internal bool hela_file_of(Ast *node);
+gb_internal i64  check_field_align(CheckerContext *ctx, Type *struct_type, Ast *node, Ast *align_ast, Type *field_type);
+gb_internal i64  check_field_offset(CheckerContext *ctx, Type *struct_type, Ast *node, Ast *offset_ast, Ast *align_ast, Type *field_type);
+gb_internal String check_field_share(CheckerContext *ctx, Token share_token);
+gb_internal bool   check_field_atomic(CheckerContext *ctx, Type *struct_type, Ast *node, Token tok, Type *field_type, bool has_share);
 
 gb_internal void populate_using_array_index(CheckerContext *ctx, Ast *node, AstField *field, Type *t, String name, i32 idx) {
 	t = base_type(t);
@@ -184,6 +191,33 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 		bool is_using = (p->flags&FieldFlag_using) != 0;
 		bool is_subtype = (p->flags&FieldFlag_subtype) != 0;
 
+		// Hela field prefixes: `#align(N)` raises the alignment of this field's offset,
+		// `#offset(N)` pins it to an absolute byte, `#share(label)` names the writer of this field
+		// for `#+analysis sharing`. All are validated once per field group, because `x, y: u64` is
+		// one declaration.
+		i64    field_align  = 0;
+		i64    field_offset = -1;
+		String field_share  = {};
+		bool   field_atomic = false;
+		if (p->align != nullptr) {
+			field_align = check_field_align(ctx, struct_type, node, p->align, type);
+		}
+		if (p->offset != nullptr) {
+			field_offset = check_field_offset(ctx, struct_type, node, p->offset, p->align, type);
+		}
+		if (p->share.kind != Token_Invalid) {
+			field_share = check_field_share(ctx, p->share);
+		}
+		if ((p->flags & FieldFlag_atomic) != 0) {
+			Token tok = {};
+			if (p->names.count > 0) {
+				Ast *n = p->names[0];
+				if (n->kind == Ast_PolyType) n = n->PolyType.type;
+				if (n->kind == Ast_Ident)    tok = n->Ident.token;
+			}
+			field_atomic = check_field_atomic(ctx, struct_type, node, tok, type, p->share.kind != Token_Invalid);
+		}
+
 		for_array(j, p->names) {
 			Ast *name = p->names[j];
 			if (!ast_node_expect2(name, Ast_Ident, Ast_PolyType)) {
@@ -204,6 +238,10 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 			field->flags |= EntityFlag_Field;
 			if (is_using) field->flags |= EntityFlag_Using;
 			field->Variable.field_index = field_src_index;
+			field->Variable.custom_align = field_align;
+			field->Variable.custom_offset = field_offset;
+			field->Variable.share_label  = field_share;
+			field->Variable.is_atomic    = field_atomic;
 
 			add_entity(ctx, ctx->scope, name, field);
 			field->Variable.field_group_index = field_group_index;
@@ -721,6 +759,768 @@ gb_internal void set_polymorphic_record_instantiation_name(Type *named_type, Typ
 	}
 }
 
+// Hela is opted into per file with `#+dialect hela`, and it is the file that *defines* the type
+// that has to opt in: a polymorphic struct is checked again at every instantiation site, and those
+// sites may well be plain Odin.
+gb_internal bool hela_file_of(Ast *node) {
+	if (node == nullptr) {
+		return false;
+	}
+	AstFile *f = node->thread_safe_file();
+	return f != nullptr && (f->flags & AstFile_IsHela) != 0;
+}
+
+// The same question for a bare token, which is how a field prefix argument arrives.
+gb_internal bool hela_file_of_pos(TokenPos pos) {
+	if (pos.file_id <= 0) {
+		return false;
+	}
+	AstFile *f = thread_safe_get_ast_file_from_id(pos.file_id);
+	return f != nullptr && (f->flags & AstFile_IsHela) != 0;
+}
+
+// `#align(N)` on a field is the per-field form of `#min_field_align(N)`: instead of every field
+// being rounded up, one field is. `type_set_offsets_of` reads the value from the entity, so all
+// this has to do is reject the combinations where "the field's offset is aligned" is not a
+// statement that can be kept.
+gb_internal i64 check_field_align(CheckerContext *ctx, Type *struct_type, Ast *node, Ast *align_ast, Type *field_type) {
+	if (!hela_file_of(align_ast)) {
+		error(align_ast, "'#align(N)' on a field is a Hela feature: add '#+dialect hela' to the top of this file");
+		return 0;
+	}
+	ast_node(st, StructType, node);
+
+	if (struct_type->Struct.is_packed) {
+		error(align_ast, "field-level '#align' cannot be combined with '#packed': a packed struct has no padding to align into");
+		return 0;
+	}
+	if (struct_type->Struct.is_raw_union) {
+		error(align_ast, "field-level '#align' cannot be applied to a '#raw_union' struct: every variant starts at offset 0");
+		return 0;
+	}
+	if (struct_type->Struct.split_align != 0) {
+		error(align_ast, "'#split(%lld)' already fixes every field's offset; a field-level '#align' would break the stride. Drop one of them.",
+		      cast(long long)struct_type->Struct.split_align);
+		return 0;
+	}
+	if (st->max_field_align != nullptr) {
+		error(align_ast, "field-level '#align' cannot be combined with '#max_field_align': one raises a field's alignment, the other caps every field's alignment");
+		return 0;
+	}
+	if (struct_type->Struct.soa_kind != StructSoa_None) {
+		error(align_ast, "field-level '#align' cannot be applied to a '#soa' type: the fields are transposed into separate arrays, so a field has no single offset");
+		return 0;
+	}
+
+	i64 align = 0;
+	if (!check_custom_align(ctx, align_ast, &align, "align")) {
+		return 0;
+	}
+	i64 natural = type_align_of(field_type);
+	if (align < natural) {
+		error(align_ast, "'#align(%lld)' is below the natural alignment of the field's type (%lld). A field can be pushed further out, never pulled in: use a smaller type, or '#packed' for a wire format.",
+		      cast(long long)align, cast(long long)natural);
+		return 0;
+	}
+	return align;
+}
+
+// The integer in `#offset(N)`. It is *not* required to be a power of two, because it is a byte
+// position rather than the state of an alignment unit; it only has to be a non-negative constant.
+gb_internal bool check_offset_constant(CheckerContext *ctx, Ast *node, i64 *offset_) {
+	Operand o = {};
+	check_expr(ctx, &o, node);
+	if (o.mode != Addressing_Constant) {
+		if (o.mode != Addressing_Invalid) {
+			error(node, "#offset must be a constant");
+		}
+		return false;
+	}
+	Type *type = base_type(o.type);
+	if (!is_type_untyped(type) && !is_type_integer(type)) {
+		error(node, "#offset must be an integer");
+		return false;
+	}
+	if (o.value.kind != ExactValue_Integer) {
+		error(node, "#offset must be an integer");
+		return false;
+	}
+	BigInt v = o.value.value_integer;
+	if (v.used > 1) {
+		gbAllocator a = heap_allocator();
+		String str = big_int_to_string(a, &v);
+		error(node, "#offset too large, %.*s", LIT(str));
+		gb_free(a, str.text);
+		return false;
+	}
+	i64 off = big_int_to_i64(&v);
+	if (off < 0) {
+		error(node, "#offset must not be negative, got %lld", cast(long long)off);
+		return false;
+	}
+	*offset_ = off;
+	return true;
+}
+
+// `#offset(N)` is the absolute-position counterpart of `#align(N)`: instead of "the next multiple
+// of N", it says "byte N, and the bytes in front of it are declared by this prefix alone". That is
+// what a wire header or a memory-mapped register block wants, and it is also the only way to say
+// "leave exactly this much room" without inventing a padding field.
+//
+// It does not raise the struct's alignment: a pinned field is already at a fixed distance from the
+// start of the struct, so the position is reproduced for every element of an array as long as the
+// offset is a multiple of the field type's own alignment — which is exactly what is checked here.
+gb_internal i64 check_field_offset(CheckerContext *ctx, Type *struct_type, Ast *node, Ast *offset_ast, Ast *align_ast, Type *field_type) {
+	if (!hela_file_of(offset_ast)) {
+		error(offset_ast, "'#offset(N)' on a field is a Hela feature: add '#+dialect hela' to the top of this file");
+		return -1;
+	}
+	ast_node(st, StructType, node);
+
+	if (align_ast != nullptr) {
+		error(offset_ast, "'#offset(N)' and '#align(N)' both place this field: '#offset' is an exact byte position, '#align' the next multiple of N. Keep one of them.");
+		return -1;
+	}
+	if (struct_type->Struct.is_packed) {
+		error(offset_ast, "field-level '#offset' cannot be combined with '#packed': a packed struct is defined by having no gaps at all");
+		return -1;
+	}
+	if (struct_type->Struct.is_raw_union) {
+		error(offset_ast, "field-level '#offset' cannot be applied to a '#raw_union' struct: every variant starts at offset 0");
+		return -1;
+	}
+	if (struct_type->Struct.split_align != 0) {
+		error(offset_ast, "'#split(%lld)' already fixes every field's offset, so '#offset' is redundant here. Drop one of them.",
+		      cast(long long)struct_type->Struct.split_align);
+		return -1;
+	}
+	if (st->max_field_align != nullptr) {
+		error(offset_ast, "field-level '#offset' cannot be combined with '#max_field_align': a pinned field is placed by byte position, not by an alignment cap");
+		return -1;
+	}
+	if (struct_type->Struct.soa_kind != StructSoa_None) {
+		error(offset_ast, "field-level '#offset' cannot be applied to a '#soa' type: the fields are transposed into separate arrays, so a field has no single offset");
+		return -1;
+	}
+
+	i64 off = 0;
+	if (!check_offset_constant(ctx, offset_ast, &off)) {
+		return -1;
+	}
+
+	if (is_type_polymorphic(field_type)) {
+		return off; // the alignment of a `$T` field is only known at instantiation
+	}
+	i64 natural = type_align_of(field_type);
+	if (natural > 0 && off%natural != 0) {
+		i64 below = off - off%natural;
+		error(offset_ast, "'#offset(%lld)' is not a multiple of the field type's alignment (%lld), so the field would be read unaligned. Use '#offset(%lld)' or '#offset(%lld)', or '#packed' if the format really is unaligned.",
+		      cast(long long)off, cast(long long)natural, cast(long long)below, cast(long long)(below+natural));
+		return -1;
+	}
+	return off;
+}
+
+// `type_set_offsets_of` puts an `#offset(N)` field at exactly N. This confirms it, and reports the
+// one mistake that cannot be fixed silently: a field pinned to a byte an earlier field already
+// covers. Same idea as `check_struct_split_fields` — the compiler keeps the promise or the build
+// fails, rather than quietly moving the field.
+gb_internal void check_struct_offset_fields(Type *t, Ast *node) {
+	if (t->Struct.is_polymorphic) {
+		return;
+	}
+	bool any = false;
+	for (Entity *f : t->Struct.fields) {
+		if (type_field_offset_of(f) >= 0) {
+			any = true;
+			break;
+		}
+	}
+	if (!any) {
+		return;
+	}
+	type_set_offsets(t);
+
+	for_array(i, t->Struct.fields) {
+		Entity *f    = t->Struct.fields[i];
+		i64     want = type_field_offset_of(f);
+		if (want < 0) {
+			continue;
+		}
+		i64 got = t->Struct.offsets[i];
+		if (got != want) {
+			error(f->token, "'#offset(%lld)' asks for '%.*s' to start at byte %lld, but the previous field already ends at byte %lld. Move it further out, or reorder the fields.",
+			      cast(long long)want, LIT(f->token.string),
+			      cast(long long)want, cast(long long)got);
+		}
+	}
+}
+
+// `#atomic` declares that this field is read/written with atomic operations. It changes no bytes;
+// what it buys is a *checkable* concurrency contract: the compiler verifies the field can in fact
+// be accessed atomically, and the layout manifest exports it next to the field's `#share` owner.
+// `layout_hash` deliberately ignores it: the hash is a fingerprint of bytes, not of annotations.
+gb_internal bool check_field_atomic(CheckerContext *ctx, Type *struct_type, Ast *node, Token tok,
+                                    Type *field_type, bool has_share) {
+	if (!hela_file_of(node)) {
+		error(tok, "'#atomic' on a field is a Hela feature: add '#+dialect hela' to the top of this file");
+		return false;
+	}
+	if (struct_type->Struct.is_packed) {
+		error(tok, "'#atomic' cannot be combined with '#packed': a packed field may be unaligned, and atomic loads require natural alignment");
+		return false;
+	}
+	if (struct_type->Struct.is_raw_union) {
+		error(tok, "'#atomic' cannot be applied to a '#raw_union' struct: the variants alias the same bytes");
+		return false;
+	}
+	if (struct_type->Struct.soa_kind != StructSoa_None) {
+		error(tok, "'#atomic' cannot be applied to a '#soa' type: the field is transposed into an array, with no single address to make atomic");
+		return false;
+	}
+	if (is_type_polymorphic(field_type)) {
+		return true; // the concrete type is only known at the instantiation
+	}
+	Type *bt = base_type(field_type);
+	bool atomic_capable = is_type_integer(bt) || is_type_boolean(bt) || is_type_pointer(bt) || is_type_enum(bt);
+	i64 size = type_size_of(field_type);
+	if (!atomic_capable || !(size == 1 || size == 2 || size == 4 || size == 8)) {
+		error(tok, "'#atomic' requires a lock-free 1/2/4/8-byte integer, pointer, bool or enum field, got %lld bytes", cast(long long)size);
+		return false;
+	}
+	if (!has_share && ast_file_analysis(node->thread_safe_file(), AnalysisFlag_Sharing)) {
+		error(tok, "'#atomic' field needs a '#share(label)' naming the writer that owns it; otherwise the ownership map in the layout manifest is incomplete");
+		return false;
+	}
+	return true;
+}
+
+// `#share(label)` names the code that writes this field, so that `#+analysis sharing` can compare
+// two writers against the cache lines they end up on. The label is a plain name, not a symbol: it
+// only has to be equal for fields written by the same thread/actor and different otherwise.
+gb_internal String check_field_share(CheckerContext *ctx, Token share_token) {
+	if (!hela_file_of_pos(share_token.pos)) {
+		error(share_token, "'#share(label)' on a field is a Hela feature: add '#+dialect hela' to the top of this file");
+		return {};
+	}
+	String s = share_token.string;
+	if (s.len >= 2 && s[0] == '"') {
+		String unquoted = s;
+		if (!unquote_string(permanent_allocator(), &unquoted, 0, false)) {
+			error(share_token, "Invalid string literal");
+			return {};
+		}
+		s = unquoted;
+	}
+	if (s.len == 0) {
+		error(share_token, "'#share' needs a non-empty writer name");
+		return {};
+	}
+	return s;
+}
+
+// `#split(N)` is `#align(N)` + `#min_field_align(N)` with the resulting padding declared instead of
+// implied, which is what lets it be combined with the byte-map guarantee: the offsets are not
+// "whatever the ABI decided", they are `round_up(previous_end, N)`, so a tool can predict them.
+//
+// This runs before any offset is computed, so it only has to install the alignment. The promise is
+// verified afterwards, once the field types are known, in `check_struct_split_fields`.
+gb_internal i64 check_struct_split_stride(CheckerContext *ctx, Type *t, Ast *node) {
+	ast_node(st, StructType, node);
+	if (!hela_file_of(node)) {
+		error(st->split, "'struct #split(N)' is a Hela feature: add '#+dialect hela' to the top of this file");
+		return 0;
+	}
+	if (t->Struct.split_align != 0) {
+		return t->Struct.split_align; // already resolved (a re-checked instantiation)
+	}
+
+	bool conflict = false;
+	if (st->is_packed) {
+		error(st->split, "'#split' cannot be combined with '#packed': a packed struct has no padding, so there is no stride to place fields on");
+		conflict = true;
+	}
+	if (st->align != nullptr) {
+		error(st->split, "'#split(N)' already sets the struct alignment to N, so '#align' is redundant");
+		conflict = true;
+	}
+	if (st->min_field_align != nullptr) {
+		error(st->split, "'#split(N)' is the declared form of '#min_field_align(N)', so neither is needed with the other");
+		conflict = true;
+	}
+	if (st->max_field_align != nullptr) {
+		error(st->split, "'#split(N)' cannot be combined with '#max_field_align': capping a field's alignment below the stride would break the stride");
+		conflict = true;
+	}
+	if (st->is_explicit) {
+		error(st->split, "'#split(N)' and '#explicit' both define the whole layout; keep only '#split'. '#split(N)' already fixes every field's offset, so '#explicit' would add nothing but padding fields");
+		conflict = true;
+	}
+	if (t->Struct.is_raw_union) {
+		error(st->split, "'#split' cannot be applied to a '#raw_union' struct: every variant starts at offset 0");
+		conflict = true;
+	}
+	if (t->Struct.soa_kind != StructSoa_None) {
+		error(st->split, "'#split' cannot be applied to a '#soa' type: the fields are transposed into separate arrays");
+		conflict = true;
+	}
+	if (conflict) {
+		return 0;
+	}
+
+	i64 stride = 0;
+	if (!check_custom_align(ctx, st->split, &stride, "split")) {
+		return 0;
+	}
+
+	t->Struct.custom_min_field_align = stride;
+	if (t->Struct.custom_align == 0) {
+		t->Struct.custom_align = stride;
+	}
+	t->Struct.split_align = stride;
+	return stride;
+}
+
+// The check that makes `#split` worth having: after the offsets exist, confirm that each field
+// really does start at `round_up(previous_end, stride)`. It is redundant with
+// `type_set_offsets_of` by construction, and that is the point — it turns "the compiler inserts
+// some padding" into "the compiler keeps this promise, or the build fails".
+gb_internal void check_struct_split_fields(Type *t, Ast *node) {
+	i64 stride = t->Struct.split_align;
+	if (stride <= 0) {
+		return;
+	}
+	type_set_offsets(t);
+
+	i64 expected = 0;
+	for_array(i, t->Struct.fields) {
+		Entity *f    = t->Struct.fields[i];
+		i64     off  = t->Struct.offsets[i];
+		i64     want = align_formula(expected, stride);
+		if (off != want) {
+			error(f->token, "'#split(%lld)' puts '%.*s' at offset %lld, but the stride requires %lld",
+			      cast(long long)stride, LIT(f->token.string),
+			      cast(long long)off, cast(long long)want);
+		}
+		expected = off + type_size_of(f->type);
+	}
+}
+
+gb_internal void check_struct_explicit_layout(CheckerContext *ctx, Type *t, Ast *node) {
+	if (!hela_file_of(node)) {
+		error(node, "'struct #explicit' is a Hela feature: add '#+dialect hela' to the top of this file");
+		return;
+	}
+	ast_node(st, StructType, node);
+	if (st->is_split) {
+		return; // `check_struct_split_stride` has already reported the conflict
+	}
+	if (t->Struct.is_raw_union) {
+		error(node, "'#explicit' cannot be applied to a '#raw_union' struct: every variant starts at offset 0, so there is no byte map to check");
+		return;
+	}
+	if (t->Struct.soa_kind != StructSoa_None) {
+		error(node, "'#explicit' cannot be applied to a '#soa' type: the fields are transposed into separate arrays, so there is no single byte map to check");
+		return;
+	}
+	if (t->Struct.is_polymorphic) {
+		return;
+	}
+
+	type_set_offsets(t);
+
+	// `#align(N)` inserts the very padding that `#explicit` says must be written out, so the two
+	// cannot both be the description of the same bytes. Report that instead of the padding it
+	// would have produced, which would only confuse the two mistakes.
+	for_array(i, t->Struct.fields) {
+		Entity *f = t->Struct.fields[i];
+		if (type_field_align_of(f) != 0) {
+			error(f->token, "field '#align(%lld)' and 'struct #explicit' conflict: '#align' inserts unnamed padding, which is exactly what '#explicit' forbids. Write the padding fields yourself, or drop '#explicit'.",
+			      cast(long long)type_field_align_of(f));
+			return;
+		}
+	}
+
+	i64 cursor  = 0;
+	i64 size    = type_size_of(t);
+	bool failed = false;
+
+	for_array(i, t->Struct.fields) {
+		Entity *f    = t->Struct.fields[i];
+		i64     off  = t->Struct.offsets[i];
+		i64     fsize = type_size_of(f->type);
+		if (off > cursor) {
+			// An `#offset(N)` field declares the gap in front of it — that is the whole point of
+			// pinning a field to an absolute byte — so it is not "implicit" padding.
+			if (type_field_offset_of(f) < 0) {
+				error(f->token, "'struct #explicit' requires every byte to be named: %lld byte(s) of implicit padding before '%.*s' (it starts at offset %lld, the previous field ends at %lld). Add a padding field such as `_: [%lld]u8`.",
+				      cast(long long)(off - cursor), LIT(f->token.string),
+				      cast(long long)off, cast(long long)cursor, cast(long long)(off - cursor));
+				failed = true;
+			}
+		} else if (off < cursor) {
+			error(f->token, "field '%.*s' overlaps the previous field: it starts at offset %lld, but the previous field ends at %lld",
+			      LIT(f->token.string), cast(long long)off, cast(long long)cursor);
+			failed = true;
+		}
+		if (off + fsize > cursor) {
+			cursor = off + fsize;
+		}
+	}
+
+	if (size > cursor) {
+		error(node, "'struct #explicit' requires every byte to be named: %lld byte(s) of implicit trailing padding (size is %lld, the fields end at %lld). Add a padding field such as `_: [%lld]u8`.",
+		      cast(long long)(size - cursor), cast(long long)size, cast(long long)cursor, cast(long long)(size - cursor));
+		failed = true;
+	}
+
+	if (!failed) {
+		t->Struct.is_explicit_layout = true;
+	}
+}
+
+// One labelled field as seen from the struct that contains it: which bytes it owns, and who
+// writes them. Nested by-value structs are flattened so the analysis can compare fields across
+// the boundary between two nested fields — a boundary no nested type's own analysis can see past.
+// Pointers and arrays are boundaries too: a pointed-to element does not live here, and an array
+// adds nothing the element type's own analysis does not already say.
+struct Shared_Field_Range {
+	String label;
+	String path;    // dotted path from the outer struct's field name
+	i64    offset;  // absolute, from the start of the struct being checked
+	i64    size;
+	isize  top_field; // index of the outer struct's direct field this range lives in
+	Token  token;
+};
+
+static String sharing_join_path(String prefix, String name, gbAllocator a) {
+	isize  n   = prefix.len + 1 + name.len;
+	char *buf = gb_alloc_array(a, char, n + 1);
+	gb_memmove(buf, prefix.text, prefix.len);
+	buf[prefix.len] = '.';
+	gb_memmove(buf + prefix.len + 1, name.text, name.len);
+	return make_string(cast(u8 *)buf, n);
+}
+
+// base_type, guarded: a field's type may be a named type that is still being checked, and
+// `alloc_type` does not zero memory — `Named.base` can be garbage, and walking it is a segfault.
+// A named type whose TypeName entity has not reached Resolved has no trustworthy base yet; that
+// instantiation will be analyzed on its own once its own check completes.
+static Type *sharing_resolved_base_type(Type *t) {
+	while (t != nullptr && t->kind == Type_Named) {
+		Entity *e = t->Named.type_name;
+		if (e == nullptr || e->state < EntityState_Resolved) {
+			return nullptr;
+		}
+		t = t->Named.base;
+	}
+	return t;
+}
+
+// A struct the analysis may flatten into: concrete, not a union or SOA view. Polymorphic
+// templates and their specializations are excluded — computing their offsets from a field
+// declaration site caches a layout that is not final yet, and codegen later asserts on it.
+static bool sharing_struct_flattenable(Type *t) {
+	if (t == nullptr || t->kind != Type_Struct) {
+		return false;
+	}
+	if (t->Struct.soa_kind != StructSoa_None || t->Struct.is_raw_union) {
+		return false;
+	}
+	if (t->Struct.polymorphic_params != nullptr) {
+		return false;
+	}
+	if ((t->flags & (TypeFlag_Polymorphic | TypeFlag_PolySpecialized)) != 0) {
+		return false;
+	}
+	return true;
+}
+
+// Does anything under this type carry a '#share' label? Deliberately side-effect free: it reads
+// field lists and type kinds only, never offsets. The sharing analysis runs for every struct in
+// a file that opts in, most of them unannotated — this is what keeps those walks from touching
+// layout, which for polymorphic-heavy code can compute offsets too early.
+static bool sharing_type_has_labels(Type *t, int depth) {
+	if (!sharing_struct_flattenable(t) || depth > 16) {
+		return false;
+	}
+	for_array(i, t->Struct.fields) {
+		Entity *f = t->Struct.fields[i];
+		if (f == nullptr || f->type == nullptr) {
+			continue;
+		}
+		if (f->Variable.share_label.len > 0) {
+			return true;
+		}
+		Type *ft = sharing_resolved_base_type(f->type);
+		if (ft != nullptr && sharing_type_has_labels(ft, depth + 1)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void collect_shared_field_ranges(Type *t, String prefix, i64 base, isize top_field, int depth, gbAllocator a, Array<Shared_Field_Range> *out) {
+	if (!sharing_struct_flattenable(t)) {
+		return;
+	}
+	if (depth > 16) {
+		return; // a by-value struct cannot contain itself; this is belt and braces
+	}
+	// Never trigger offset computation here. The outer struct's own type_set_offsets (the same
+	// call the rest of the checker uses) has already laid out its fields' types by the time this
+	// runs; computing a nested type's offsets from a field declaration site can cache a layout
+	// that is not final yet, and codegen asserts on the stale result later.
+	if (!t->Struct.are_offsets_set) {
+		return;
+	}
+	for_array(i, t->Struct.fields) {
+		Entity *f = t->Struct.fields[i];
+		if (f->type == nullptr) {
+			continue;
+		}
+		i64 off = base + t->Struct.offsets[i];
+		String path = prefix;
+		if (f->token.string.len > 0) {
+			path = sharing_join_path(prefix, f->token.string, a);
+		}
+		if (f->Variable.share_label.len > 0) {
+			Shared_Field_Range r = {};
+			r.label     = f->Variable.share_label;
+			r.path      = path;
+			r.offset    = off;
+			r.size      = type_size_of(f->type);
+			r.top_field = top_field;
+			r.token     = f->token;
+			array_add(out, r);
+		}
+		Type *ft = sharing_resolved_base_type(f->type);
+		if (ft == nullptr || ft->kind != Type_Struct || f->token.string.len == 0) {
+			continue;
+		}
+		collect_shared_field_ranges(ft, path, off, top_field, depth + 1, a, out);
+	}
+}
+
+static bool shared_ranges_on_one_line(i64 a_off, i64 a_size, i64 b_off, i64 b_size, i64 cache_line) {
+	i64 a_last = (a_off + a_size - 1) / cache_line;
+	i64 b_last = (b_off + b_size - 1) / cache_line;
+	return !(a_last < b_off / cache_line || b_last < a_off / cache_line);
+}
+
+// `#share(label)` says which code writes a field; this does what the hardware does with that
+// information — puts two writers on one cache line and reports it.
+//
+// The rule is deliberately narrow. Only annotated fields are compared, and only pairs with
+// *different* labels: a field with no label is not necessarily read-only (it may be written by the
+// same code as everything else), so the analysis stays quiet rather than guessing. Two fields with
+// the same label are written by the same code by construction, so sharing a line is fine there —
+// that is the normal "one thread owns this group" case.
+//
+// Pairs are reported where they become visible. Within one struct, that is this function. Across
+// two nested by-value structs, the boundary pair is only visible here, so this function reports
+// it; pairs inside one nested field stay the nested type's own business (its file runs the same
+// analysis when it opts in). That keeps every error attached to the layout decision that caused
+// it, and keeps one conflict from being reported once per enclosing struct.
+//
+// The cache-line size is the same one `-emit-layout` and `layout_cache_lines_of` use, so the check
+// and the manifest cannot disagree; use `-layout-cache-line:128` on a machine that fetches 128.
+gb_internal void check_struct_sharing(Type *t, Ast *node) {
+	if (t->Struct.soa_kind != StructSoa_None) {
+		return;
+	}
+	if (t->Struct.is_raw_union) {
+		return;
+	}
+	i64 cache_line = get_layout_cache_line();
+	if (cache_line <= 0) {
+		return;
+	}
+
+	// Cheap, side-effect-free gate first: most structs carry no '#share' anywhere, and for them
+	// the analysis must not touch layout — computing offsets at field-declaration time is what
+	// poisons polymorphic instantiations and asserts in codegen later.
+	bool any_direct = false;
+	for_array(i, t->Struct.fields) {
+		Entity *f = t->Struct.fields[i];
+		if (f != nullptr && f->Variable.share_label.len > 0) {
+			any_direct = true;
+			break;
+		}
+	}
+	bool interesting = any_direct;
+	if (!interesting) {
+		for_array(i, t->Struct.fields) {
+			Entity *f = t->Struct.fields[i];
+			if (f == nullptr || f->type == nullptr) {
+				continue;
+			}
+			Type *ft = sharing_resolved_base_type(f->type);
+			if (ft != nullptr && sharing_type_has_labels(ft, 1)) {
+				interesting = true;
+				break;
+			}
+		}
+	}
+	if (!interesting) {
+		return;
+	}
+
+	// Flatten nested by-value structs. Offsets must exist before this loop reads them; t itself
+	// is a concrete struct whose fields have finished checking, the same timing the #explicit and
+	// #offset checks use.
+	type_set_offsets(t);
+	Array<Shared_Field_Range> nested = {};
+	array_init(&nested, heap_allocator());
+	defer (array_free(&nested));
+	for_array(i, t->Struct.fields) {
+		Entity *f = t->Struct.fields[i];
+		if (f->type == nullptr) {
+			continue;
+		}
+		Type *ft = sharing_resolved_base_type(f->type);
+		if (ft == nullptr || ft->kind != Type_Struct || f->token.string.len == 0) {
+			continue;
+		}
+		collect_shared_field_ranges(ft, f->token.string, t->Struct.offsets[i], i, 1, heap_allocator(), &nested);
+	}
+
+	for_array(i, t->Struct.fields) {
+		Entity *a = t->Struct.fields[i];
+		if (a->Variable.share_label.len == 0) {
+			continue;
+		}
+		i64 a_off  = t->Struct.offsets[i];
+		i64 a_size = type_size_of(a->type);
+		i64 a_last = (a_off + a_size - 1) / cache_line;
+		if (a_last > a_off / cache_line) {
+			// Writes to one cache line dirty the whole line; a field that straddles two is two
+			// invalidations for one store, and it can never be read atomically.
+			warning(a->token, "'%.*s' is written by '%.*s' and spans %lld cache lines (bytes %lld..%lld, line size %lld): every write invalidates both lines",
+			        LIT(a->token.string), LIT(a->Variable.share_label),
+			        cast(long long)(a_last - a_off/cache_line + 1),
+			        cast(long long)a_off, cast(long long)(a_off + a_size - 1), cast(long long)cache_line);
+		}
+
+		for (isize j = i+1; j < t->Struct.fields.count; j++) {
+			Entity *b = t->Struct.fields[j];
+			if (b->Variable.share_label.len == 0) {
+				continue;
+			}
+			if (b->Variable.share_label == a->Variable.share_label) {
+				continue; // same writer, sharing a line is the point
+			}
+			i64 b_off  = t->Struct.offsets[j];
+			i64 b_size = type_size_of(b->type);
+			if (!shared_ranges_on_one_line(a_off, a_size, b_off, b_size, cache_line)) {
+				continue;
+			}
+			i64 line = gb_max(a_off / cache_line, b_off / cache_line);
+			error(b->token, "False sharing: '%.*s' (written by '%.*s', bytes %lld..%lld) and '%.*s' (written by '%.*s', bytes %lld..%lld) both live in cache line %lld. Every write to one invalidates the line the other writer is using. Separate them with '#align(%lld)' on one of the fields, or '#split(%lld)' on the struct.",
+			      LIT(b->token.string), LIT(b->Variable.share_label),
+			      cast(long long)b_off, cast(long long)(b_off + b_size - 1),
+			      LIT(a->token.string), LIT(a->Variable.share_label),
+			      cast(long long)a_off, cast(long long)(a_off + a_size - 1),
+			      cast(long long)line, cast(long long)cache_line, cast(long long)cache_line);
+		}
+	}
+
+	// A nested struct whose bytes the outer struct misplaced: its own analysis computes lines
+	// from offset 0, and no longer describes where its fields actually live. One warning per
+	// misplaced field, not per field inside it — the fix is the same either way.
+	u8 *misplacement_reported = gb_alloc_array(heap_allocator(), u8, cast(isize)t->Struct.fields.count);
+	gb_zero_size(misplacement_reported, t->Struct.fields.count);
+	defer (gb_free(heap_allocator(), misplacement_reported));
+	for_array(k, nested) {
+		Shared_Field_Range *r = &nested[k];
+		if (r->top_field < 0 || r->top_field >= t->Struct.fields.count) {
+			continue;
+		}
+		if (misplacement_reported[r->top_field]) {
+			continue;
+		}
+		i64 base = t->Struct.offsets[r->top_field];
+		if (base % cache_line == 0) {
+			continue;
+		}
+		misplacement_reported[r->top_field] = 1;
+		warning(t->Struct.fields[r->top_field]->token, "'%.*s' contains '#share' annotations but starts at byte %lld, which is not a multiple of the cache line (%lld): the nested type's own sharing analysis assumes offset 0, so those results no longer describe where the fields actually live. Add '#align(%lld)' to the field.",
+		        LIT(t->Struct.fields[r->top_field]->token.string),
+		        cast(long long)base, cast(long long)cache_line, cast(long long)cache_line);
+	}
+
+	// Pairs across a field boundary. A direct labelled field against anything nested under a
+	// different field, and ranges from two different nested fields. A direct field's label
+	// against its own interior is also cross-boundary: the nested type cannot see the label the
+	// outer struct put on it as a whole, so only this struct can compare the two.
+	for_array(i, t->Struct.fields) {
+		Entity *a = t->Struct.fields[i];
+		if (a->Variable.share_label.len == 0) {
+			continue;
+		}
+		i64 a_off  = t->Struct.offsets[i];
+		i64 a_size = type_size_of(a->type);
+		for_array(k, nested) {
+			Shared_Field_Range *r = &nested[k];
+			if (r->label == a->Variable.share_label) {
+				continue;
+			}
+			if (!shared_ranges_on_one_line(a_off, a_size, r->offset, r->size, cache_line)) {
+				continue;
+			}
+			i64 line = gb_max(a_off / cache_line, r->offset / cache_line);
+			error(r->token, "False sharing: '%.*s' (written by '%.*s', bytes %lld..%lld) and '%.*s' (written by '%.*s', bytes %lld..%lld) both live in cache line %lld. Every write to one invalidates the line the other writer is using. Separate them with '#align(%lld)' on one of the fields.",
+			      LIT(r->path), LIT(r->label),
+			      cast(long long)r->offset, cast(long long)(r->offset + r->size - 1),
+			      LIT(a->token.string), LIT(a->Variable.share_label),
+			      cast(long long)a_off, cast(long long)(a_off + a_size - 1),
+			      cast(long long)line, cast(long long)cache_line);
+		}
+	}
+
+	for (isize k = 0; k < nested.count; k++) {
+		Shared_Field_Range *a = &nested[k];
+		for (isize m = k+1; m < nested.count; m++) {
+			Shared_Field_Range *b = &nested[m];
+			if (b->top_field == a->top_field) {
+				continue; // interior of one nested field: that type's own analysis
+			}
+			if (b->label == a->label) {
+				continue;
+			}
+			if (!shared_ranges_on_one_line(a->offset, a->size, b->offset, b->size, cache_line)) {
+				continue;
+			}
+			i64 line = gb_max(a->offset / cache_line, b->offset / cache_line);
+			error(b->token, "False sharing: '%.*s' (written by '%.*s', bytes %lld..%lld) and '%.*s' (written by '%.*s', bytes %lld..%lld) both live in cache line %lld. Every write to one invalidates the line the other writer is using. Separate them with '#align(%lld)' on one of the fields.",
+			      LIT(b->path), LIT(b->label),
+			      cast(long long)b->offset, cast(long long)(b->offset + b->size - 1),
+			      LIT(a->path), LIT(a->label),
+			      cast(long long)a->offset, cast(long long)(a->offset + a->size - 1),
+			      cast(long long)line, cast(long long)cache_line);
+		}
+	}
+
+	// The same false sharing, seen from outside the type: `[N]T` and `make([]T, n)` repeat T, so
+	// element i's tail abuts element i+1's head. If an element is not a whole number of cache
+	// lines, the last field of one element and the first field of the next share a line — two
+	// writers, one line — and if the element does not start on a line boundary, every field
+	// inside it is shifted off the lines the type's own analysis assumed. Stated once here, on
+	// the type, because it is a property of the type, not of one array.
+	i64 type_size  = type_size_of(t);
+	i64 type_align = type_align_of(t);
+	if (type_size % cache_line != 0) {
+		warning(node, "this struct carries '#share' annotations but is %lld bytes, not a multiple of the cache line (%lld): in an array or slice, the last field of one element and the first field of the next land in the same cache line. Pad it to a multiple of %lld (a trailing `_: [%lld]u8`), or mark it '#split(%lld)'.",
+		        cast(long long)type_size, cast(long long)cache_line,
+		        cast(long long)cache_line, cast(long long)(cache_line - type_size % cache_line),
+		        cast(long long)cache_line);
+	} else if (type_align % cache_line != 0) {
+		warning(node, "this struct carries '#share' annotations and is %lld bytes but only %lld-byte aligned: an array of it may start off a cache line boundary, which shifts every field inside every element away from the lines the type's own analysis assumed. Add '#align(%lld)' (or '#split(%lld)').",
+		        cast(long long)type_size, cast(long long)type_align,
+		        cast(long long)cache_line, cast(long long)cache_line);
+	}
+}
+
 gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly, GenTypesData *poly_gen_types_to_unlock) {
 	GB_ASSERT(is_type_struct(struct_type));
 	ast_node(st, StructType, node);
@@ -757,6 +1557,7 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 	struct_type->Struct.node           = node;
 	struct_type->Struct.scope          = ctx->scope;
 	struct_type->Struct.is_packed      = st->is_packed;
+	struct_type->Struct.is_explicit_layout = st->is_explicit;
 	struct_type->Struct.is_all_or_none = st->is_all_or_none;
 	struct_type->Struct.polymorphic_params = check_record_polymorphic_params(
 		ctx, st->polymorphic_params,
@@ -794,6 +1595,9 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 	ST_ALIGN(min_field_align);
 	ST_ALIGN(max_field_align);
 	ST_ALIGN(align);
+	if (st->is_split) {
+		check_struct_split_stride(ctx, struct_type, node);
+	}
 	if (struct_type->Struct.custom_align != 0 &&
 		struct_type->Struct.custom_align < struct_type->Struct.custom_min_field_align) {
 		error(st->align, "#align(%lld) is defined to be less than #min_field_align(%lld)",
@@ -848,6 +1652,28 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 
 		struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
 		wait_signal_set(&struct_type->Struct.fields_wait_signal);
+
+		if (struct_type->Struct.split_align != 0) {
+			check_struct_split_fields(struct_type, node);
+			struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+		}
+
+		// `#offset(N)`: confirm that each pinned field really did land on the byte it asked for.
+		check_struct_offset_fields(struct_type, node);
+		struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+
+		if (st->is_explicit) {
+			check_struct_explicit_layout(ctx, struct_type, node);
+			struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+		}
+
+		// `#+analysis sharing`: only runs where a field carries `#share`, and only on a concrete
+		// struct (an unspecialized template has no offsets yet).
+		AstFile *file = node->thread_safe_file();
+		if (ast_file_analysis(file, AnalysisFlag_Sharing)) {
+			check_struct_sharing(struct_type, node);
+			struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+		}
 	}
 
 }
@@ -4914,6 +5740,66 @@ gb_internal Type *make_soa_struct_internal(CheckerContext *ctx, Ast *array_typ_e
 	return soa_struct;
 }
 
+// `#aosoa[W][N]T` — array of structures of arrays. Elements are grouped into blocks of W; inside a
+// block the fields are transposed, so scanning one field over consecutive elements is a contiguous
+// walk while a block still fits in a few cache lines.
+//
+//     #aosoa[16][65536]Vec3   ==   [4096]#soa[16]Vec3
+//
+// The spelling starts from the logical side because that is what the rest of the program indexes
+// with: `N` is how many elements exist, `W` is the tuning knob. Reaching `arr[i/W].x[i%W]` by hand
+// is the same memory, but the two numbers live in different places and one of them is usually
+// wrong after a refactor.
+//
+// No code generation is involved. An array whose element type is a `#soa[W]T` struct *is* the
+// block-transposed layout, and selecting/indexing inside a block already lowers to the right
+// address, so `#aosoa` is a checked desugaring plus a record of the intent for `-emit-layout`.
+gb_internal Type *check_aosoa_array_type(CheckerContext *ctx, Ast *e, AstArrayType *at, Type *elem, i64 count, Type *generic_type) {
+	Type *fallback = alloc_type_array(elem, count, generic_type);
+
+	if (!hela_file_of(e)) {
+		error(at->aosoa_block, "'#aosoa[W]' is a Hela feature: add '#+dialect hela' to the top of this file");
+		return fallback;
+	}
+	if (generic_type != nullptr) {
+		error(at->aosoa_block, "'#aosoa' needs a concrete element count, not a polymorphic one");
+		return fallback;
+	}
+	if (is_type_polymorphic(elem)) {
+		error(at->aosoa_block, "'#aosoa' needs a concrete element type: the block layout is `W` copies of each field, which cannot be laid out before the type is known");
+		return fallback;
+	}
+	Type *elem_bt = base_type(elem);
+	if (elem_bt == nullptr || elem_bt->kind != Type_Struct) {
+		gbString str = type_to_string(elem);
+		error(at->aosoa_block, "'#aosoa' needs a struct element type, got '%s'", str);
+		gb_string_free(str);
+		return fallback;
+	}
+	if (elem_bt->Struct.soa_kind != StructSoa_None) {
+		error(at->aosoa_block, "'#aosoa' cannot be applied to a '#soa' type: the element is already transposed");
+		return fallback;
+	}
+
+	Operand o = {};
+	i64 width = check_array_count(ctx, &o, at->aosoa_block);
+	if (width <= 0 || (width & (width-1)) != 0) {
+		error(at->aosoa_block, "'#aosoa' block width must be a power of two, got %lld", cast(long long)width);
+		return fallback;
+	}
+	if (count % width != 0) {
+		error(at->count, "'#aosoa[%lld]' needs an element count that is a multiple of the block width, got %lld. Use %lld or %lld, or make the last block partial by hand.",
+		      cast(long long)width, cast(long long)count,
+		      cast(long long)(count - count%width), cast(long long)(count - count%width + width));
+		return fallback;
+	}
+
+	Type *block = make_soa_struct_fixed(ctx, e, at->elem, elem, width, nullptr);
+	Type *t = alloc_type_array(block, count/width, nullptr);
+	t->Array.aosoa_width = cast(i32)width;
+	return t;
+}
+
 
 gb_internal Type *make_soa_struct_fixed(CheckerContext *ctx, Ast *array_typ_expr, Ast *elem_expr, Type *elem, i64 count, Type *generic_type) {
 	return make_soa_struct_internal(ctx, array_typ_expr, elem_expr, elem, count, generic_type, StructSoa_Fixed);
@@ -5000,6 +5886,11 @@ gb_internal void check_array_type_internal(CheckerContext *ctx, Ast *e, Type **t
 			error(at->count, "? can only be used in conjunction with compound literals");
 			count = 0;
 			count_recovered = true;
+		}
+
+		if (at->aosoa_block != nullptr) {
+			*type = check_aosoa_array_type(ctx, e, at, elem, count, generic_type);
+			return;
 		}
 
 
