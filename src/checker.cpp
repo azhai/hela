@@ -2,6 +2,8 @@
 
 #include "entity.cpp"
 #include "types.cpp"
+#include "bit_layout.cpp" // Hela: bit-segment queries shared by intrinsics and -emit-layout
+#include "layout_hash.cpp" // Hela: layout fingerprint shared by `layout_hash_of` and -emit-layout
 
 
 gb_internal u64 type_hash_canonical_type(Type *type);
