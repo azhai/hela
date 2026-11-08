@@ -330,11 +330,20 @@ enum VetFlags : u64 {
 };
 
 enum AnalysisFlags : u64 {
-	AnalysisFlag_NONE   = 0,
-	AnalysisFlag_Escape = 1u<<0,
-	AnalysisFlag_Atomic = 1u<<1,
+	AnalysisFlag_NONE    = 0,
+	AnalysisFlag_Escape  = 1u<<0,
+	AnalysisFlag_Atomic  = 1u<<1,
+	// `#+analysis sharing`: check that the fields a `#share(label)` says are written by different
+	// code do not land on the same cache line. Unlike the other two it is not on by default: it
+	// needs `#share` annotations to have anything to say.
+	AnalysisFlag_Sharing = 1u<<2,
+	// `#+analysis alloc`: reject calls that take `context.allocator` / `context.temp_allocator`
+	// implicitly. Unlike the others this one is opt-in: turning it on by default would reject
+	// ordinary Odin code that calls `make()` without spelling out its allocator.
+	AnalysisFlag_Alloc   = 1u<<3,
 
-	AnalysisFlag_All = AnalysisFlag_Escape|AnalysisFlag_Atomic,
+	// Deliberately does NOT include `AnalysisFlag_Alloc`: a file has to ask for it.
+	AnalysisFlag_All = AnalysisFlag_Escape|AnalysisFlag_Atomic|AnalysisFlag_Sharing,
 };
 
 u64 get_analysis_flag_from_name(String const &name) {
@@ -342,6 +351,10 @@ u64 get_analysis_flag_from_name(String const &name) {
 		return AnalysisFlag_Escape;
 	} else if (name == "atomic") {
 		return AnalysisFlag_Atomic;
+	} else if (name == "sharing") {
+		return AnalysisFlag_Sharing;
+	} else if (name == "alloc") {
+		return AnalysisFlag_Alloc;
 	}
 	return AnalysisFlag_NONE;
 }
@@ -584,6 +597,11 @@ struct BuildContext {
 	String          export_semantics_file;
 	Array<String>   export_semantics_for; // specific files
 
+	SemanticsFormat emit_layout_format;
+	String          emit_layout_file;
+	Array<String>   emit_layout_for;   // specific files, empty means "the packages named on the command line"
+	i64             layout_cache_line; // bytes, LAYOUT_DEFAULT_CACHE_LINE unless `-layout-cache-line` says otherwise
+
 	bool   ignore_unused_defineables;
 	bool   show_system_calls;
 	bool   keep_temp_files;
@@ -719,6 +737,17 @@ struct BuildContext {
 };
 
 gb_global BuildContext build_context = {0};
+
+// `-layout-cache-line` default. 64 bytes is the line size on x86-64 and on most ARM cores; Apple
+// Silicon performance cores fetch 128 bytes, so `-layout-cache-line:128` is the honest setting
+// there. `-emit-layout` and `intrinsics.layout_cache_lines_of` both read it through this function,
+// so the manifest and a `#assert` can never disagree.
+enum : i64 { LAYOUT_DEFAULT_CACHE_LINE = 64 };
+
+gb_internal i64 get_layout_cache_line(void) {
+	i64 n = build_context.layout_cache_line;
+	return n > 0 ? n : LAYOUT_DEFAULT_CACHE_LINE;
+}
 
 gb_internal bool IS_ODIN_DEBUG(void) {
 	return build_context.ODIN_DEBUG;

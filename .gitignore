@@ -324,3 +324,9 @@ cmake-build*/
 CMakeLists.txt
 sandbox/
 __pycache__/
+
+# Local agent/IDE data for this fork
+.workbuddy/
+
+# stray build outputs
+/testing

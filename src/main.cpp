@@ -68,6 +68,7 @@ gb_global Timings global_timings = {0};
 #include "checker.cpp"
 #include "docs.cpp"
 #include "semantics_writer.cpp"
+#include "layout_writer.cpp"
 
 #include "cached.cpp"
 
@@ -433,6 +434,8 @@ enum BuildFlagKind {
 	BuildFlag_NoEntryPoint,
 	BuildFlag_NoEscapeAnalysis,
 	BuildFlag_NoAtomicAnalysis,
+	BuildFlag_NoSharingAnalysis,
+	BuildFlag_NoAllocAnalysis,
 	BuildFlag_Linker,
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
@@ -447,6 +450,10 @@ enum BuildFlagKind {
 	BuildFlag_ExportSemantics,
 	BuildFlag_ExportSemanticsFile,
 	BuildFlag_ExportSemanticsFor,
+	BuildFlag_EmitLayout,
+	BuildFlag_EmitLayoutFile,
+	BuildFlag_EmitLayoutFor,
+	BuildFlag_LayoutCacheLine,
 	BuildFlag_IgnoreUnusedDefineables,
 
 	BuildFlag_Vet,
@@ -714,6 +721,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_NoEntryPoint,            str_lit("no-entry-point"),            BuildFlagParam_None,    Command__does_check &~ Command_test);
 	add_flag(&build_flags, BuildFlag_NoEscapeAnalysis,        str_lit("no-escape-analysis"),        BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoAtomicAnalysis,        str_lit("no-atomic-analysis"),        BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_NoSharingAnalysis,       str_lit("no-sharing-analysis"),       BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_NoAllocAnalysis,         str_lit("no-alloc-analysis"),         BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_Linker,                  str_lit("linker"),                    BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
@@ -728,6 +737,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_ExportSemantics,         str_lit("export-semantics"),          BuildFlagParam_String,  Command_check);
 	add_flag(&build_flags, BuildFlag_ExportSemanticsFile,     str_lit("export-semantics-file"),     BuildFlagParam_String,  Command_check);
 	add_flag(&build_flags, BuildFlag_ExportSemanticsFor,      str_lit("export-semantics-for"),      BuildFlagParam_String,  Command_check, true);
+	add_flag(&build_flags, BuildFlag_EmitLayout,              str_lit("emit-layout"),               BuildFlagParam_String,  Command_check);
+	add_flag(&build_flags, BuildFlag_EmitLayoutFile,          str_lit("emit-layout-file"),          BuildFlagParam_String,  Command_check);
+	add_flag(&build_flags, BuildFlag_EmitLayoutFor,           str_lit("emit-layout-for"),           BuildFlagParam_String,  Command_check, true);
+	add_flag(&build_flags, BuildFlag_LayoutCacheLine,         str_lit("layout-cache-line"),         BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_IgnoreUnusedDefineables, str_lit("ignore-unused-defineables"), BuildFlagParam_None,    Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_Vet,                     str_lit("vet"),                       BuildFlagParam_None,    Command__does_check);
@@ -1177,6 +1190,84 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							array_add(&build_context.export_semantics_for, path_to_full_path(heap_allocator(), path));
 							break;
 						}
+						case BuildFlag_EmitLayout: {
+							GB_ASSERT(value.kind == ExactValue_String);
+
+							if (value.value_string == "json") {
+								build_context.emit_layout_format = SemanticsFormat_Json;
+							} else if (value.value_string == "cbor") {
+								build_context.emit_layout_format = SemanticsFormat_Cbor;
+							} else {
+								gb_printf_err("Invalid layout format for -emit-layout:<string>, got %.*s\n", LIT(value.value_string));
+								gb_printf_err("Valid layout formats:\n");
+								gb_printf_err("\tjson\n");
+								gb_printf_err("\tcbor\n");
+								bad_flags = true;
+							}
+							break;
+						}
+						case BuildFlag_EmitLayoutFile: {
+							GB_ASSERT(value.kind == ExactValue_String);
+
+							String export_path = string_trim_whitespace(value.value_string);
+							if (is_build_flag_path_valid(export_path)) {
+								build_context.emit_layout_file = path_to_full_path(heap_allocator(), export_path);
+							} else {
+								gb_printf_err("Invalid -emit-layout-file path, got %.*s\n", LIT(export_path));
+								bad_flags = true;
+							}
+							break;
+						}
+						case BuildFlag_EmitLayoutFor: {
+							GB_ASSERT(value.kind == ExactValue_String);
+							// Repeated flags and comma separated lists both work:
+							//   -emit-layout-for:core/hela/layout -emit-layout-for:core/nbio
+							//   -emit-layout-for:core/hela/layout,core/nbio
+							String rest = string_trim_whitespace(value.value_string);
+							while (rest.len > 0) {
+								isize cut = -1;
+								for (isize i = 0; i < rest.len; i++) {
+									if (rest[i] == ',') {
+										cut = i;
+										break;
+									}
+								}
+								String part;
+								if (cut >= 0) {
+									part = string_trim_whitespace(substring(rest, 0, cut));
+									rest = string_trim_whitespace(substring(rest, cut+1, rest.len));
+								} else {
+									part = rest;
+									rest = String{};
+								}
+								if (part.len == 0) {
+									continue;
+								}
+								if (!is_build_flag_path_valid(part)) {
+									gb_printf_err("Invalid -emit-layout-for path, got %.*s\n", LIT(part));
+									bad_flags = true;
+									continue;
+								}
+								array_add(&build_context.emit_layout_for, path_to_full_path(heap_allocator(), part));
+							}
+							break;
+						}
+						case BuildFlag_LayoutCacheLine: {
+							GB_ASSERT(value.kind == ExactValue_String);
+
+							String text = string_trim_whitespace(value.value_string);
+							char const *cstr = alloc_cstring(temporary_allocator(), text);
+							char *end = nullptr;
+							u64 n = gb_str_to_u64(cstr, &end, 10);
+							bool ok = end != nullptr && *end == '\0' && n >= 8 && n <= 65536 && (n & (n-1)) == 0;
+							if (!ok) {
+								gb_printf_err("Invalid -layout-cache-line, got %.*s; expected a power of two between 8 and 65536\n", LIT(text));
+								bad_flags = true;
+							} else {
+								build_context.layout_cache_line = cast(i64)n;
+							}
+							break;
+						}
 						case BuildFlag_IgnoreUnusedDefineables: {
 							GB_ASSERT(value.kind == ExactValue_Invalid);
 							build_context.ignore_unused_defineables = true;
@@ -1492,6 +1583,12 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_NoAtomicAnalysis:
 							build_context.no_analysis_flags |= AnalysisFlag_Atomic;
+							break;
+						case BuildFlag_NoSharingAnalysis:
+							build_context.no_analysis_flags |= AnalysisFlag_Sharing;
+							break;
+						case BuildFlag_NoAllocAnalysis:
+							build_context.no_analysis_flags |= AnalysisFlag_Alloc;
 							break;
 						case BuildFlag_NoThreadLocal:
 							build_context.no_thread_local = true;
@@ -3203,6 +3300,32 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "Exports the semantics of only this file. Can be given several times.");
 			print_usage_line(2, "Example: -export-semantics-for:src/main.odin");
 		}
+
+		if (print_flag("-emit-layout:<format>")) {
+			print_usage_line(2, "Exports the memory layout of every type in the packages named on the command line:");
+			print_usage_line(2, "size, align, every field's offset and size, padding, cache-line occupancy and a stable layout hash.");
+			print_usage_line(2, "Meant to be read by tools and by `intrinsics.layout_*` assertions. Defaults to layout.json / layout.cbor.");
+			print_usage_line(2, "Available options:");
+				print_usage_line(3, "-emit-layout:json   Exports in JSON format");
+				print_usage_line(3, "-emit-layout:cbor   Exports in CBOR format");
+		}
+
+		if (print_flag("-emit-layout-file:<filename>")) {
+			print_usage_line(2, "Specifies the filename for `-emit-layout`.");
+			print_usage_line(2, "Example: -emit-layout-file:layout.json");
+		}
+
+		if (print_flag("-emit-layout-for:<file-or-package>")) {
+			print_usage_line(2, "Restricts `-emit-layout` to the types declared in the named files or package directories.");
+			print_usage_line(2, "Keeps the manifest small in a big project. Repeatable, and comma separated lists are allowed.");
+			print_usage_line(2, "Example: -emit-layout-for:core/hela/layout,tests/hela/layout");
+		}
+
+		if (print_flag("-layout-cache-line:<bytes>")) {
+			print_usage_line(2, "Cache line size assumed by `-emit-layout` and `intrinsics.layout_cache_lines_of`.");
+			print_usage_line(2, "Must be a power of two. Default: 64. Use 128 on Apple Silicon.");
+			print_usage_line(2, "Example: -layout-cache-line:128");
+		}
 	}
 
 	if (check) {
@@ -3386,6 +3509,10 @@ gb_internal int print_show_help(String const arg0, String command, String option
 	}
 
 	if (check) {
+		if (print_flag("-no-sharing-analysis")) {
+			print_usage_line(2, "Disables the check that two fields written by different '#share' labels are on different cache lines.");
+			print_usage_line(2, "It only runs on structs that carry '#share' labels; files with '#+analysis sharing' keep it on.");
+		}
 		if (print_flag("-no-atomic-analysis")) {
 			print_usage_line(2, "Disables the analysis of atomic memory orderings, except in files with '#+analysis atomic'.");
 			print_usage_line(2, "It warns where what is written with release ordering is only loaded with relaxed ordering, or the reverse.");
@@ -4244,6 +4371,7 @@ int main(int arg_count, char const **arg_ptr) {
 	map_init(&build_context.defined_values);
 	build_context.extra_packages.allocator = heap_allocator();
 	build_context.export_semantics_for.allocator = heap_allocator();
+	build_context.emit_layout_for.allocator = heap_allocator();
 
 	init_build_context_error_pos_style();
 
@@ -4466,6 +4594,12 @@ int main(int arg_count, char const **arg_ptr) {
 	if (build_context.export_semantics_format == SemanticsFormat_Invalid &&
 	    (build_context.export_semantics_file.len != 0 || build_context.export_semantics_for.count != 0)) {
 		gb_printf_err("`-export-semantics-file` and `-export-semantics-for` need `-export-semantics:<format>`\n");
+		return 1;
+	}
+
+	if (build_context.emit_layout_format == SemanticsFormat_Invalid &&
+	    (build_context.emit_layout_file.len != 0 || build_context.emit_layout_for.count != 0)) {
+		gb_printf_err("`-emit-layout-file` and `-emit-layout-for` need `-emit-layout:<format>`\n");
 		return 1;
 	}
 
@@ -4805,6 +4939,11 @@ int main(int arg_count, char const **arg_ptr) {
 	if (build_context.export_semantics_format != SemanticsFormat_Invalid) {
 		MAIN_TIME_SECTION("export semantics");
 		export_semantics(checker);
+	}
+
+	if (build_context.emit_layout_format != SemanticsFormat_Invalid) {
+		MAIN_TIME_SECTION("emit layout");
+		emit_layout(checker);
 	}
 
 	if (any_errors()) {
