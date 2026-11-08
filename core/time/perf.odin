@@ -27,6 +27,18 @@ tick_add :: proc "contextless" (t: Tick, d: Duration) -> Tick {
 }
 
 /*
+Read a tick as a plain nanosecond count. `Tick` keeps its counter in a
+private-looking field, but callers outside core:time legitimately need the raw
+number (mono-ns gauges, last-render timestamps stored in `#atomic u64` fields);
+without this they either transmute or reach into `_nsec` directly, which is
+worse. Same "relative amount" semantics as the field itself.
+*/
+@(require_results)
+tick_nanoseconds :: proc "contextless" (t: Tick) -> i64 {
+	return t._nsec
+}
+
+/*
 Obtain the difference between ticks.
 */
 @(require_results)
