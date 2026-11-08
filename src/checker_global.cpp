@@ -1041,6 +1041,7 @@ gb_internal void global_graph_walk(GlobalGraphWalk *w, Ast *node) {
 		global_graph_walk(w, node->StructType.align);
 		global_graph_walk(w, node->StructType.min_field_align);
 		global_graph_walk(w, node->StructType.max_field_align);
+		global_graph_walk(w, node->StructType.split);
 		global_graph_walk_slice(w, node->StructType.where_clauses);
 		break;
 	case Ast_UnionType:
