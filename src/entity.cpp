@@ -283,6 +283,16 @@ struct Entity {
 			String     link_suffix;
 			String     link_section;
 			i64        custom_align;
+			// Hela: for a struct field, the absolute byte offset declared by `#offset(N)`, or -1
+			// when the field is placed by the ordinary alignment rules. Also read only by the
+			// layout pass: the backend already receives the resulting offsets.
+			i64        custom_offset;
+			// Hela: for a struct field, the writer named by `#share(label)` (empty when none).
+			// `-layout` and `#+analysis sharing` read it; it never reaches code generation.
+			String     share_label;
+			// Hela: for a struct field, `#atomic` declares cross-thread atomic access. Metadata
+			// only: it never reaches code generation and does not participate in layout_hash.
+			bool       is_atomic;
 			CommentGroup *docs;
 			CommentGroup *comment;
 			bool       is_foreign;
@@ -551,6 +561,9 @@ gb_internal Entity *alloc_entity_const_param(Scope *scope, Token token, Type *ty
 gb_internal Entity *alloc_entity_field(Scope *scope, Token token, Type *type, bool is_using, i32 field_index, EntityState state = EntityState_Unresolved) {
 	Entity *entity = alloc_entity_variable(scope, token, type, state);
 	entity->Variable.field_index = field_index;
+	// -1 means "no `#offset(N)`": arena memory is zeroed, so this has to be set explicitly or
+	// every ordinary field would look like it was pinned to byte 0.
+	entity->Variable.custom_offset = -1;
 	if (is_using) entity->flags |= EntityFlag_Using;
 	entity->flags |= EntityFlag_Field;
 	return entity;
