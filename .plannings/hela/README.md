@@ -4,7 +4,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| `00-plan.md` | 总览、进度表（M0–M28）、端到端链路、下一步 |
+| `00-plan.md` | 总览、进度表（M0–M29）、端到端链路、下一步 |
 | `01-m1-emit-layout.md` | `-emit-layout` 布局清单：schema、设计决定、验证数据 |
 | `02-m2-dialect-marker.md` | 文件头方言标识 `#+dialect hela`：为什么放弃 `.hel` 扩展名、按定义处文件判定 |
 | `03-m3-struct-explicit.md` | `struct #explicit`：逐字节显式、错误信息、方言门控 |
@@ -29,6 +29,7 @@
 | `22-m26-layout-hash.md` | 布局指纹的单一真源与运行时握手：`src/layout_hash.cpp` 抽取（6 份 golden 未变即证明）、`layout_hash_of` 编译期常量、`core:hela/abi` 的 24 B `Stamp` 与 8 类拒绝原因、整包 16 类型的清单对账；两个真坑（别名必须 `base_type` 否则 hash 假一致、`#split(N)` 会抬高 align） |
 | `23-m27-membw.md` | 内存层次的实测曲线：本机延迟台阶 1.4/5.5/100 ns、单核 63 GB/s / 10 线程 100 GB/s、SSD 1.8（1 读者）→3.1 GB/s、`read` 9.6 vs `mmap` 13.2、单趟 vs 两趟扫描 63 vs 30 GB/s；三个"测出来像结论"的坑与「cache line 是 128 而默认是 64」 |
 | `24-m28-cache-line-assumption.md` | 让清单说出它的假设：清单 **v8** 的 `cache_line_explicit`（bool 而非三态枚举的取舍）、`line_banner` 的三种措辞、`--cache-line:N` 让同一份清单给两个答案（0 冲突 vs `owner=CONFLICT`）、`straddle_summary` 客户端重算 M25 不变量、`cbor_lint.py` 守手写的 map 长度、membw 断言抓到自己（「内层读得比 DRAM 快」实测 1.02x 被推翻） |
+| `25-m29-upstream-sync.md` | 上游同步：`main` 从快照换成 odin master，**验收标准是 tree SHA 与上游逐字节相同**（`d861ef6`）；`git fetch` 在本机代理下四轮都断在响应末尾（curl 18）→ 改 codeload tarball；两类特例：90 个 CRLF 文件不能 `git add`（`hash-object --no-filters` + `index-info`）、99 个 vendor 预编译库在上游是 LFS 指针（168.5 MiB 反推回 132 B）；合进 hela 只有 `check_type.cpp` 一个冲突，解法是「以上游为底、重打 hela 的 9 个 hunk」；顺带发现上游把 `odin test` 对无测试包改成硬报错（xrep `test.sh` 已适配）|
 
 ## 快速验证
 

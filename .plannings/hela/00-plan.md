@@ -39,6 +39,7 @@
 | M27 | 内存层次实测（`tests/hela/membw`） | ✅ | **零编译器改动，纯测量**：六段探针给出本机（Apple M4）的依赖加载延迟台阶 **1.4 / 5.5 / 100 ns**（L1 64 KiB → L2 4 MiB → DRAM）、单线程流式读 **63 GB/s**、10 线程聚合 **≈100 GB/s**、复制 84 GB/s、SSD 裸读 **1.8 GB/s（1 读者）/ 3.1 GB/s（≥2 读者）**、热缓存 `read_entire_file` 9.6 vs `mmap` 13.2 GB/s；扫描侧证实**空间在趟数不在向量宽度**（单候选 62 / 双候选两趟 30 / 双候选单趟 63 GB/s）。三个"测出来像结论"的坑：依赖加载环被优化器删掉（全报 0.00 ns）、不设 `F_NOCACHE` 写入则"设备速度"其实是 DRAM（14 GB/s）、本机 **cache line 是 128 而编译器默认 64**。`run.sh` **29 步**，见 `23-m27-membw.md` |
 
 | M28 | 清单声明它的 cache line 假设（v8 + 报告横幅 + `--cache-line` 覆盖） | ✅ | **零语法改动、零 golden 刷新**：清单 **v8** 顶层加 `cache_line_explicit`（bool，能表达"有人给过值/没人给过值"的最小信息；`cache_line` 与它都不进 `layout_hash`，6 份 golden 一字未变）；`core:hela/layout/lines.odin` 把线宽变成带出处的**透镜**（`Line_Source{.Declared,.Default,.Overridden}` + 三种措辞的 `line_banner`），`--contract`/`--waste` 抬头必报按哪条线算；`hela-layout --cache-line:N` 让**同一份清单给两个答案**（`Cursors` 64 B → 0 冲突，128 B → `owner=CONFLICT` + 「192 B 不是 128 的整数倍」），且编译器 `-layout-cache-line:128` 给出同样两条结论（工具不是"第二个意见"）；`straddle_summary` 只用 offsets 重算 M25 不变量，证明清单自足；`tests/hela/cbor_lint.py` 守手写的 CBOR map 长度（改坏 `0xa7→0xa6` 立报）；`membw` 第 7 段把 M27 的曲线变成 5 条断言（失败 `os.exit(1)`）。**断言抓到自己**：上一版「内层读得比 DRAM 快」实测 46.35 vs 45.50 GB/s 被推翻 → 改为 note（单线程流式带宽与层级无关，差别只在延迟 66x 与聚合 2.2x）。`run.sh` **29 步**（第 2 步 CBOR 结构、第 15 步 v8 provenance、第 17 步两条线两个答案、第 28 步曲线断言），见 `24-m28-cache-line-assumption.md` |
+| M29 | 上游同步（odin master `7f5fe36`） | ✅ | **维护动作，零新特性**：`main` 从 dev-2026-11 快照换成上游 master，验收标准是 **tree SHA 与上游逐字节相同**（`d861ef6`）而不是"看起来一样"。`git fetch` 在本机代理下四轮全断在响应末尾（`curl 18`，只差 5–18 KB），改走 codeload tarball（1.4 MB/s，比 git 端点快 8 倍）。两类特例：①90 个文件上游本来存 CRLF，而本仓 `.gitattributes` 是 `text=auto`，`git add` 会改写 → 改用 `hash-object --no-filters` + `update-index --index-info`；②99 个 vendor 预编译库在上游是 Git LFS 指针，tarball 给的是解析后的 **168.5 MiB** 真文件 → 用 `sha256`+`size` 反推回 132 B 指针。区间 `dev-2026-11→master` 新增 272 / 修改 459 / 删除 20。合进 hela 只有 `src/check_type.cpp` 一个冲突（两边同点插入），解法是**以上游为底**重打 hela 的 9 个 hunk（20/21 干净应用 + 2 处手工：补 `poly_operands_have_errors`、上游把 `wait_signal_set` 提到 `if` 块外而 hela 的检查占了原位 → 两个都留）。验证：编译器重建零错、`run.sh` **29/29**、xrep `verify.sh` 全绿（153 单测 + 78/34/56 golden）、上游 `tests/core` **1495** 与 `tests/internal` **273** 全过，hela 侧 144 个文件的增删行数与合并前逐项相同。见 `25-m29-upstream-sync.md` |
 
 > 注：25/26 是 `run.sh` 的**测试步骤**数，不是里程碑编号。M15/M16 的语言改造与库族取舍见 `14-m15-runtime.md`；
 > M19 的运行时设计、两个真坑与「为何零语法改动」见 `15-m19-exec.md`；
@@ -48,7 +49,8 @@
 > M24 的报告归属原则、安全 `base_type` 与「分析不得触碰布局」的教训见 `20-m24-cross-type-sharing.md`；
 > M25 的数组边界规则、1.79x 实测与 xrep 的负面结论见 `21-m25-array-elements.md`；
 > M26 的单一真源抽取、`#split` 与 align 的关系、以及「别名会撞 hash」的实测见 `22-m26-layout-hash.md`；
-> M28 的 v8 取舍（bool 而非枚举、为何默认不能抬到 128）、`--cache-line` 的两次读法与「断言抓到自己」见 `24-m28-cache-line-assumption.md`。
+> M28 的 v8 取舍（bool 而非枚举、为何默认不能抬到 128）、`--cache-line` 的两次读法与「断言抓到自己」见 `24-m28-cache-line-assumption.md`；
+> M29 的同步手法（tree SHA 对账、CRLF 与 LFS 两个特例、换方向合并冲突）与「`odin test` 无测试包即报错」的上游行为变化见 `25-m29-upstream-sync.md`。
 
 ## 端到端链路
 
