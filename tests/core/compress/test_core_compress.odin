@@ -15,6 +15,9 @@ import "core:compress"
 import "core:compress/deflate"
 import "core:compress/shoco"
 import "core:bytes"
+import "core:mem"
+
+SLIM_TESTS :: #config(ODIN_TEST_SLIM, false)
 
 @test
 zlib_test :: proc(t: ^testing.T) {
@@ -39,7 +42,7 @@ zlib_test :: proc(t: ^testing.T) {
 	}
 
 	buf: [dynamic]byte
-	err := deflate.inflate_zlib(&buf, ODIN_DEMO)
+	err := deflate.decompress_zlib(&buf, ODIN_DEMO)
 
 	testing.expect(t, err == nil, "ZLIB failed to decompress ODIN_DEMO")
 	s := string(buf[:])
@@ -47,6 +50,9 @@ zlib_test :: proc(t: ^testing.T) {
 	testing.expect(t, s[68] == 240 && s[69] == 159 && s[70] == 152, "ZLIB result should've contained 😃 at position 68.")
 	testing.expect(t, len(s) == 438, "ZLIB result has an unexpected length.")
 	delete(buf)
+	for kind in Stream_Kind {
+		sinks_check(t, "ODIN_DEMO", .Zlib, kind, ODIN_DEMO)
+	}
 
 	expect_truncated_fails(t, "ODIN_DEMO", .ZLIB, ODIN_DEMO)
 }
@@ -66,12 +72,15 @@ gzip_test :: proc(t: ^testing.T) {
 	}
 
 	buf: [dynamic]byte
-	err := deflate.inflate_gzip(&buf, TEST)
+	err := deflate.decompress_gzip(&buf, TEST)
 
 	testing.expect(t, err == nil, "GZIP failed to decompress TEST")
 	testing.expect(t, string(buf[:]) == "payload", "GZIP result wasn't 'payload'")
 
 	delete(buf)
+	for kind in Stream_Kind {
+		sinks_check(t, "TEST", .Gzip, kind, TEST)
+	}
 
 	expect_truncated_fails(t, "TEST", .GZIP, TEST)
 }
@@ -87,9 +96,9 @@ expect_slice_fails :: proc(t: ^testing.T, name, kept: string, format: Deflate_Fo
 	buf: [dynamic]byte
 	err: compress.Error
 	switch format {
-	case .Raw:  err = deflate.inflate_raw(&buf, data)
-	case .ZLIB: err = deflate.inflate_zlib(&buf, data)
-	case .GZIP: err = deflate.inflate_gzip(&buf, data)
+	case .Raw:  err = deflate.decompress_raw(&buf, data)
+	case .ZLIB: err = deflate.decompress_zlib(&buf, data)
+	case .GZIP: err = deflate.decompress_gzip(&buf, data)
 	}
 	delete(buf)
 	testing.expectf(t, err != nil, "%v, %v: %v %v of %v bytes decompressed without error", name, format, kept, len(data), full)
@@ -104,7 +113,36 @@ expect_slice_fails :: proc(t: ^testing.T, name, kept: string, format: Deflate_Fo
 		compress.destroy_context(&ctx)
 		delete(output)
 		testing.expectf(t, ctx_err != nil, "%v, %v, %v: %v %v of %v bytes decompressed without error", name, format, kind, kept, len(data), full)
+		sinks_check(t, name, sinks_format(format), kind, data)
 	}
+}
+
+@test
+shoco_allocator_test :: proc(t: ^testing.T) {
+	ctx_track, arg_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&ctx_track, context.allocator)
+	defer mem.tracking_allocator_destroy(&ctx_track)
+	mem.tracking_allocator_init(&arg_track, context.allocator)
+	defer mem.tracking_allocator_destroy(&arg_track)
+	arg := mem.tracking_allocator(&arg_track)
+
+	input := "shoco compresses short English strings."
+	packed: [128]u8
+	size: int
+	err: compress.Error
+	{
+		context.allocator = mem.tracking_allocator(&ctx_track)
+		size, err = shoco.compress_string_to_buffer(input, packed[:], allocator = arg)
+	}
+	testing.expect(t, err == nil)
+	testing.expect_value(t, ctx_track.total_allocation_count, 0)
+	testing.expect(t, arg_track.total_allocation_count > 0)
+	testing.expect_value(t, len(arg_track.allocation_map), 0)
+
+	unpacked: [128]u8
+	n, unpack_err := shoco.decompress(packed[:size], unpacked[:])
+	testing.expect(t, unpack_err == nil)
+	testing.expect_value(t, string(unpacked[:n]), input)
 }
 
 @test
