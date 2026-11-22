@@ -709,7 +709,7 @@ struct BuildContext {
 	gbAffinity affinity;
 	isize      thread_count;
 
-	PtrMap<char const *, ExactValue> defined_values;
+	PtrMap<char const *, String> defined_values;
 
 	StringSet target_features_set;
 	String target_features_string;
@@ -779,6 +779,12 @@ gb_internal isize MAX_ERROR_COLLECTOR_COUNT(void) {
 	#define I386_MAX_ALIGNMENT 16
 #else
 	#define I386_MAX_ALIGNMENT 4
+#endif
+
+#if LLVM_VERSION_MAJOR >= 20
+	#define WASM_MAX_ALIGNMENT 16
+#else
+	#define WASM_MAX_ALIGNMENT 8
 #endif
 
 gb_global TargetMetrics target_windows_i386 = {
@@ -885,21 +891,21 @@ gb_global TargetMetrics target_netbsd_arm64 = {
 gb_global TargetMetrics target_freestanding_wasm32 = {
 	TargetOs_freestanding,
 	TargetArch_wasm32,
-	4, 4, 8, 512,
+	4, 4, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-freestanding-js"),
 };
 
 gb_global TargetMetrics target_js_wasm32 = {
 	TargetOs_js,
 	TargetArch_wasm32,
-	4, 4, 8, 512,
+	4, 4, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-js-js"),
 };
 
 gb_global TargetMetrics target_wasi_wasm32 = {
 	TargetOs_wasi,
 	TargetArch_wasm32,
-	4, 4, 8, 512,
+	4, 4, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-wasi-js"),
 };
 
@@ -907,7 +913,7 @@ gb_global TargetMetrics target_wasi_wasm32 = {
 gb_global TargetMetrics target_orca_wasm32 = {
 	TargetOs_orca,
 	TargetArch_wasm32,
-	4, 4, 8, 512,
+	4, 4, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-wasi-js"),
 };
 
@@ -915,21 +921,21 @@ gb_global TargetMetrics target_orca_wasm32 = {
 gb_global TargetMetrics target_freestanding_wasm64p32 = {
 	TargetOs_freestanding,
 	TargetArch_wasm64p32,
-	4, 8, 8, 512,
+	4, 8, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-freestanding-js"),
 };
 
 gb_global TargetMetrics target_js_wasm64p32 = {
 	TargetOs_js,
 	TargetArch_wasm64p32,
-	4, 8, 8, 512,
+	4, 8, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-js-js"),
 };
 
 gb_global TargetMetrics target_wasi_wasm64p32 = {
 	TargetOs_wasi,
-	TargetArch_wasm32,
-	4, 8, 8, 512,
+	TargetArch_wasm64p32,
+	4, 8, WASM_MAX_ALIGNMENT, 512,
 	str_lit("wasm32-wasi-js"),
 };
 

@@ -1,4 +1,3 @@
-// An implementation of the [BNG](https://bngformat.org)
 package bng
 
 import "base:intrinsics"
@@ -30,6 +29,7 @@ load_from_context :: proc(ctx: ^compress.Context, options := Default_Options, al
 	}
 
 	img = new(Image)
+	img.pixels.allocator = allocator
 	img.which = .BNG
 
 	if .return_metadata in options {
@@ -227,6 +227,7 @@ destroy :: proc(img: ^Image) {
 	if img == nil {
 		return
 	}
+	context.allocator = img.pixels.allocator if img.pixels.allocator.procedure != nil else context.allocator
 
 	delete(img.pixels)
 

@@ -20,7 +20,7 @@ NO_LEGACY_SYSCALLS :: ODIN_ARCH == .arm64 || ODIN_ARCH == .riscv64 || ODIN_PLATF
 	Available since Linux 1.0.
 	Before Linux 3.14, this operation is not atomic (i.e. not thread safe).
 */
-read :: proc "contextless" (fd: Fd, buf: []u8) -> (int, Errno) {
+read :: proc "contextless" (fd: Fd, buf: []u8) -> (bytes_read: int, err: Errno) {
 	ret := syscall(SYS_read, fd, raw_data(buf), len(buf))
 	return errno_unwrap(ret, int)
 }
@@ -37,7 +37,7 @@ read :: proc "contextless" (fd: Fd, buf: []u8) -> (int, Errno) {
 	Available since Linux 1.0
 	Before Linux 3.14 this operation is not atomic (i.e. not thread safe)
 */
-write :: proc "contextless" (fd: Fd, buf: []u8) -> (int, Errno) {
+write :: proc "contextless" (fd: Fd, buf: []u8) -> (bytes_written: int, err: Errno) {
 	ret := syscall(SYS_write, fd, raw_data(buf), len(buf))
 	return errno_unwrap(ret, int)
 }
@@ -220,10 +220,14 @@ rt_sigreturn :: proc "c" () -> ! {
 rt_sigaction :: proc "contextless" (sig: Signal, sigaction: ^Sig_Action, old_sigaction: ^Sig_Action) -> Errno {
 	// NOTE(jason): It appears that the restorer is required for i386 and amd64
 	when ODIN_ARCH == .i386 || ODIN_ARCH == .amd64 {
-		sigaction.flags += {.RESTORER}
+		if sigaction != nil {
+			sigaction.flags += {.RESTORER}
+		}
 	}
-	if sigaction != nil && sigaction.restorer == nil && .RESTORER in sigaction.flags {
-		sigaction.restorer = rt_sigreturn
+	when ODIN_ARCH != .riscv64 {
+		if sigaction != nil && sigaction.restorer == nil && .RESTORER in sigaction.flags {
+			sigaction.restorer = rt_sigreturn
+		}
 	}
 	ret := syscall(SYS_rt_sigaction, sig, sigaction, old_sigaction, size_of(Sig_Set))
 	return Errno(-ret)
@@ -422,16 +426,21 @@ dup :: proc "contextless" (fd: Fd) -> (Fd, Errno) {
 */
 dup2 :: proc "contextless" (old: Fd, new: Fd) -> (Fd, Errno) {
 	when NO_LEGACY_SYSCALLS {
-		ret := syscall(SYS_dup3, old, new, 0)
-
 		// Differences between dup2 and dup3 are:
 		//   - dup3 takes a flags argument
 		//   - dup2 does not return EINVAL
-		fd, errno := errno_unwrap(ret, Fd)
-		if errno == .EINVAL {
-			errno = .NONE
+		//   - if old == new dup3 returns EINVAL, dup2 returns new if it is a valid file descriptor
+		if old == new {
+			_, err := fcntl(new, F_GETFD)
+			if err == nil {
+				return new, .NONE
+			} else {
+				default_fd: Fd
+				return default_fd, .EBADF
+			}
 		}
-		return fd, errno
+		ret := syscall(SYS_dup3, old, new, 0)
+		return errno_unwrap(ret, Fd)
 	} else {
 		ret := syscall(SYS_dup2, old, new)
 		return errno_unwrap(ret, Fd)

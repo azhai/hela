@@ -1,4 +1,4 @@
-gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location);
+gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location, bool allow_polymorphic_type=false);
 gb_internal Type *determine_type_from_polymorphic(CheckerContext *ctx, Type *poly_type, Operand const &operand);
 gb_internal bool subst_check_specialization(CheckerContext *ctx, Type *specialization, Type *type, bool modify_type);
 gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is_variadic_, isize *variadic_index_, bool *success_, isize *specialization_count_, Array<Operand> const *operands);
@@ -126,6 +126,25 @@ gb_internal bool does_field_type_allow_using(Type *t) {
 	return false;
 }
 
+gb_internal Type *check_record_member_type_polymorphism(CheckerContext *ctx, Ast *type_expr, Type *type, i64 errors_before) {
+	if (ctx->allow_polymorphic_types || !is_type_polymorphic(type)) {
+		return type;
+	}
+	if (error_thread_count() == errors_before) {
+		Type *record = find_polymorphic_record_unspecialized(type);
+		if (record != nullptr) {
+			gbString str = type_to_string(record);
+			error(type_expr, "Invalid use of a non-specialized polymorphic type '%s'", str);
+			gb_string_free(str);
+		} else {
+			gbString str = type_to_string(type);
+			error(type_expr, "Invalid use of a polymorphic type '%s'", str);
+			gb_string_free(str);
+		}
+	}
+	return t_invalid;
+}
+
 gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entity *> *fields, String **tags, Slice<Ast *> const &params,
                                      isize init_field_capacity, Type *struct_type, String context) {
 	GB_ASSERT(node->kind == Ast_StructType);
@@ -168,7 +187,9 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 		CommentGroup *comment = p->comment;
 
 		if (type_expr != nullptr) {
+			i64 field_errors_before = error_thread_count();
 			type = check_type_expr(ctx, type_expr, nullptr);
+			type = check_record_member_type_polymorphism(ctx, type_expr, type, field_errors_before);
 			if (is_type_polymorphic(type)) {
 				// A field-level polymorphic type (e.g. `struct{x: $T}`) makes the struct polymorphic;
 				// keep the field's generic type so it can be substituted, rather than rejecting it.
@@ -589,7 +610,7 @@ gb_internal Type *check_record_polymorphic_params(CheckerContext *ctx, Ast *poly
 						if (is_type_proc(type)) {
 							t = determine_type_from_polymorphic(ctx, type, operand);
 						}
-						if (is_type_polymorphic(base_type(t))) {
+						if (operand.mode == Addressing_Invalid || is_type_polymorphic(base_type(t))) {
 							*is_polymorphic_ = true;
 							can_check_fields = false;
 						}
@@ -636,23 +657,12 @@ gb_internal bool check_record_poly_operand_specialization(CheckerContext *ctx, T
 	}
 	for (isize i = 0; i < poly_operands->count; i++) {
 		Operand o = (*poly_operands)[i];
-		if (is_type_polymorphic(o.type)) {
+		if (o.mode == Addressing_Invalid || is_type_polymorphic(o.type)) {
 			return false;
 		}
 		if (record_type == o.type) {
 			// NOTE(bill): Cycle
 			return false;
-		}
-		if (o.mode == Addressing_Type) {
-			// NOTE(bill): ANNOYING EDGE CASE FOR `where` clauses
-			// TODO(bill, 2021-03-27): Is this even a valid HACK?!
-			Entity *entity = entity_of_node(o.expr);
-			if (entity != nullptr &&
-			    entity->kind == Entity_TypeName &&
-			    entity->type == t_typeid) {
-			    	*is_polymorphic_ = true;
-				return false;
-			}
 		}
 	}
 	return true;
@@ -1521,6 +1531,31 @@ gb_internal void check_struct_sharing(Type *t, Ast *node) {
 	}
 }
 
+gb_internal bool poly_operands_have_errors(Array<Operand> *poly_operands) {
+	if (poly_operands == nullptr) {
+		return false;
+	}
+	for (Operand const &o : *poly_operands) {
+		if (o.mode != Addressing_Type || o.type == nullptr) {
+			continue;
+		}
+		Type *bt = base_type(o.type);
+		if (bt == nullptr) {
+			continue;
+		}
+		if (bt == t_invalid) {
+			return true;
+		}
+		if (bt->kind == Type_Struct && bt->Struct.has_errors.load()) {
+			return true;
+		}
+		if (bt->kind == Type_Union && bt->Union.has_errors.load()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly, GenTypesData *poly_gen_types_to_unlock) {
 	GB_ASSERT(is_type_struct(struct_type));
 	ast_node(st, StructType, node);
@@ -1629,7 +1664,7 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 		if (st->where_clauses.count > 0 && st->polymorphic_params == nullptr) {
 			error(st->where_clauses[0], "'where' clauses can only be used on structures with polymorphic parameters");
 		} else {
-			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &st->where_clauses, true);
+			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &st->where_clauses, !poly_operands_have_errors(poly_operands));
 			gb_unused(where_clause_ok);
 		}
 
@@ -1676,6 +1711,10 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 		}
 	}
 
+	// NOTE(upstream): hoisted out of the `!is_polymorphic` branch -- a polymorphic struct never
+	// runs the block above, and leaving the wait unset made its fields wait forever.
+	struct_type->Struct.has_errors.store(error_thread_count() != errors_before);
+	wait_signal_set(&struct_type->Struct.fields_wait_signal);
 }
 gb_internal void check_union_type(CheckerContext *ctx, Type *union_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly, GenTypesData *poly_gen_types_to_unlock) {
 	GB_ASSERT(is_type_union(union_type));
@@ -1713,7 +1752,7 @@ gb_internal void check_union_type(CheckerContext *ctx, Type *union_type, Ast *no
 		if (ut->where_clauses.count > 0 && ut->polymorphic_params == nullptr) {
 			error(ut->where_clauses[0], "'where' clauses can only be used on unions with polymorphic parameters");
 		} else {
-			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &ut->where_clauses, true);
+			bool where_clause_ok = evaluate_where_clauses(ctx, node, ctx->scope, &ut->where_clauses, !poly_operands_have_errors(poly_operands));
 			gb_unused(where_clause_ok);
 		}
 		union_type->Union.has_errors.store(error_thread_count() != errors_before);
@@ -1729,7 +1768,9 @@ gb_internal void check_union_type(CheckerContext *ctx, Type *union_type, Ast *no
 			// polymorphic union and recurse unboundedly. Mirrors check_struct_type.
 			continue;
 		}
+		i64 variant_errors_before = error_thread_count();
 		Type *t = check_type_expr(ctx, node, nullptr);
+		t = check_record_member_type_polymorphism(ctx, node, t, variant_errors_before);
 		if (t != nullptr && t != t_invalid) {
 			bool ok = true;
 			t = default_type(t);
@@ -3941,7 +3982,7 @@ gb_internal bool is_caller_expression(Ast *expr) {
 	return name == "caller_expression";
 }
 
-gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location) {
+gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_type, Type **out_type_, Ast *expr, bool allow_caller_location, bool allow_polymorphic_type) {
 	ParameterValue param_value = {};
 	param_value.original_ast_expr = expr;
 	if (expr == nullptr) {
@@ -3986,6 +4027,9 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 
 		if (in_type) {
 			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
+		} else if (out_type_ != nullptr && o.mode != Addressing_Invalid &&
+		           is_type_untyped(o.type) && !is_type_untyped_nil(o.type)) {
+			convert_to_typed(ctx, &o, default_type(o.type));
 		}
 
 
@@ -4046,13 +4090,32 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 		if (in_type != nullptr) {
 			*out_type_ = in_type;
 		} else {
-			*out_type_ = default_type(o.type);
+			Type *t = default_type(o.type);
+			bool declares_polymorphic_params = false;
+			if (t != nullptr && t->kind == Type_Proc && t->Proc.node != nullptr && t->Proc.node->kind == Ast_ProcType) {
+				declares_polymorphic_params = t->Proc.node->ProcType.generic;
+			}
+			if (t != nullptr && (!allow_polymorphic_type || declares_polymorphic_params) && is_type_polymorphic(t)) {
+				gbString str = type_to_string(t);
+				error(expr, "Cannot determine parameter type from a non-specialized polymorphic type '%s'", str);
+				gb_string_free(str);
+			}
+			*out_type_ = t;
 		}
 	}
 
 	return param_value;
 }
 
+
+gb_internal bool are_params_polymorphic(Slice<Entity *> const &variables) {
+	for (Entity *e : variables) {
+		if (e->kind != Entity_Variable || is_type_polymorphic(e->type)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is_variadic_, isize *variadic_index_, bool *success_, isize *specialization_count_, Array<Operand> const *operands) {
 	if (_params == nullptr) {
@@ -4109,6 +4172,9 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 		Ast *type_expr = unparen_expr(p->type);
 		Type *type = nullptr;
 		Ast *default_value = unparen_expr(p->default_value);
+		if (operands != nullptr && default_value != nullptr) {
+			default_value = clone_ast(default_value);
+		}
 		ParameterValue param_value = {};
 
 		bool is_type_param = false;
@@ -4128,7 +4194,8 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 		}
 
 		if (type_expr == nullptr) {
-			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, true);
+			bool allow_polymorphic_type = operands == nullptr && are_params_polymorphic(slice_from_array(variables));
+			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, true, allow_polymorphic_type);
 		} else {
 			Ast *original_type_expr = type_expr;
 			if (type_expr->kind == Ast_Ellipsis) {
@@ -4722,7 +4789,7 @@ gb_internal bool ast_references_poly_params(Scope *scope, Ast *node) {
 	return false;
 }
 
-gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_results) {
+gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_results, Array<Operand> const *operands, bool params_are_polymorphic) {
 	if (_results == nullptr) {
 		return nullptr;
 	}
@@ -4753,14 +4820,17 @@ gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_res
 
 		ast_node(field, Field, results[i]);
 		Ast *default_value = unparen_expr(field->default_value);
+		if (operands != nullptr && default_value != nullptr) {
+			default_value = clone_ast(default_value);
+		}
 		ParameterValue param_value = {};
 
 		Type *type = nullptr;
 		if (field->type == nullptr) {
-			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, false);
+			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, false, operands == nullptr && params_are_polymorphic);
 		} else {
 			if (ctx->allow_polymorphic_types && ast_references_poly_params(ctx->scope, field->type)) {
-				gbString name = expr_to_string(field->type);
+				gbString name = expr_to_string_exact(field->type);
 				type = alloc_type_generic(ctx->scope, 0, string_interner_insert(make_string_c(name)), nullptr);
 				gb_string_free(name);
 			} else {
@@ -4911,6 +4981,7 @@ gb_internal bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc
 	switch (cc) {
 	case ProcCC_StdCall:
 	case ProcCC_FastCall:
+	case ProcCC_VectorCall:
 		if (arch != TargetArch_i386 && arch != TargetArch_amd64) {
 			error(proc_type_node, "Invalid procedure calling convention \"%s\" for target architecture, expected either i386 or amd64, got %.*s",
 			      proc_calling_convention_strings[cc], LIT(target_arch_names[arch]));
@@ -4935,7 +5006,8 @@ gb_internal bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc
 	bool no_poly_return = c->disallow_polymorphic_return_types;
 	c->disallow_polymorphic_return_types = c->scope == c->polymorphic_scope;
 	// NOTE(zen3ger): if the parapoly scope is the current proc's scope, then the return types shall not declare new poly vars
-	Type *results = check_get_results(c, c->scope, pt->results);
+	bool params_are_polymorphic = params != nullptr && are_params_polymorphic(params->Tuple.variables);
+	Type *results = check_get_results(c, c->scope, pt->results, operands, params_are_polymorphic);
 	c->disallow_polymorphic_return_types = no_poly_return;
 
 	isize param_count = 0;
@@ -5019,6 +5091,7 @@ gb_internal bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc
 				break;
 			case ProcCC_Odin:
 			case ProcCC_Contextless:
+			case ProcCC_VectorCall:
 				error(e->token, "Calling convention does not support #c_vararg");
 				break;
 			}
